@@ -10,7 +10,7 @@ export default function App() {
         <div className="app-header-side app-header-left">
           {/* replace /logo-left.png with your actual file */}
           <img
-            src="/vmrc.png"
+            src="/oregon.jpg"
             alt="Left logo"
             className="header-logo-img"
           />
@@ -25,7 +25,7 @@ export default function App() {
         <div className="app-header-side app-header-right">
           {/* replace /logo-right.png with your actual file */}
           <img
-            src="/oregon.png"
+            src="/vmrc.png"
             alt="Right logo"
             className="header-logo-img"
           />

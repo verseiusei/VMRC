@@ -1,6 +1,19 @@
 // ----------------------------------------------
-// src/components/map/BaseMap.jsx  (AOI + Inspector)
+// src/components/map/BaseMap.jsx  (AOI + Click-to-sample)
 // ----------------------------------------------
+
+// Leaflet marker icon fix (if you later use markers elsewhere)
+import L from "leaflet";
+import marker2x from "leaflet/dist/images/marker-icon-2x.png";
+import marker from "leaflet/dist/images/marker-icon.png";
+import shadow from "leaflet/dist/images/marker-shadow.png";
+
+delete L.Icon.Default.prototype._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: marker2x,
+  iconUrl: marker,
+  shadowUrl: shadow,
+});
 
 import React, { useEffect, useRef, useState } from "react";
 import {
@@ -9,15 +22,14 @@ import {
   GeoJSON,
   LayersControl,
   useMap,
-  Marker,
-  Tooltip
+  useMapEvents,
 } from "react-leaflet";
 
 import "leaflet/dist/leaflet.css";
 import "@geoman-io/leaflet-geoman-free";
 import "@geoman-io/leaflet-geoman-free/dist/leaflet-geoman.css";
 
-import { getRasterValueAt } from "../../lib/rasterApi"; // <-- path to rasterApi
+import { sampleRasterValue } from "../../lib/rasterApi";
 import RasterOverlay from "./RasterOverlay";
 
 // ======================================================
@@ -62,7 +74,7 @@ function MapTools({ onUserClipChange }) {
       console.log("🔥 PM CREATE FIRED — POLYGON CAPTURED");
       const newLayer = e.layer;
 
-      // ❗ Only remove the previous user-drawn clip,
+      // Only remove the previous user-drawn clip,
       // NEVER touch the AOI GeoJSON layer.
       if (lastDrawnLayerRef.current && map.hasLayer(lastDrawnLayerRef.current)) {
         map.removeLayer(lastDrawnLayerRef.current);
@@ -83,46 +95,6 @@ function MapTools({ onUserClipChange }) {
   }, [map, onUserClipChange]);
 
   return null; // this component is only for side-effects
-}
-
-// ======================================================
-// MAP INSPECTOR – click to get value at location
-// ======================================================
-function MapInspector({ activeRasterId, onValueLoaded }) {
-  const map = useMap();
-
-  useEffect(() => {
-    if (!map) return;
-    if (!activeRasterId) return;
-
-    const handleClick = async (e) => {
-      const { lat, lng } = e.latlng;
-      try {
-        const res = await getRasterValueAt({
-          rasterLayerId: activeRasterId,
-          lat,
-          lon: lng,
-        });
-
-        onValueLoaded({
-          lat,
-          lon: lng,
-          value: res.value,
-          isValid: res.is_valid,
-        });
-      } catch (err) {
-        console.error("Inspector error:", err);
-        onValueLoaded(null);
-      }
-    };
-
-    map.on("click", handleClick);
-    return () => {
-      map.off("click", handleClick);
-    };
-  }, [map, activeRasterId, onValueLoaded]);
-
-  return null;
 }
 
 // ======================================================
@@ -163,18 +135,62 @@ function LegendControl() {
 }
 
 // ======================================================
+// CLICK SAMPLER – real .tif value, only after clip
+// ======================================================
+function ClickSampler({ activeRasterId, overlayBounds, onSample }) {
+  useMapEvents({
+    async click(e) {
+      console.log("📍 Map clicked:", e.latlng);
+
+      // Only respond if we actually have a clipped raster visible
+      if (!activeRasterId) {
+        console.log("❌ No active raster, ignoring click");
+        return;
+      }
+
+      if (!overlayBounds) {
+        console.log("❌ No overlay bounds (no clip yet), ignoring click");
+        return;
+      }
+
+      const { lat, lng } = e.latlng;
+
+      try {
+        const result = await sampleRasterValue({
+          rasterLayerId: activeRasterId,
+          lat,
+          lng,
+        });
+
+        console.log("🎯 Sample Result from .tif:", result);
+
+        onSample({
+          lat,
+          lon: lng,
+          value: result.value,
+          isNoData: result.is_nodata,
+        });
+      } catch (err) {
+        console.error("❌ Sample failed:", err);
+        // keep last sample on screen instead of clearing it
+      }
+    },
+  });
+
+  return null;
+}
+
+// ======================================================
 // MAIN MAP COMPONENT
 // ======================================================
 export default function BaseMap({
   globalAoi,
-  uploadedAoi,      // NEW
   userClip,
   overlayUrl,
   overlayBounds,
   onUserClipChange,
   activeRasterId,
 }) {
-
   const [inspectInfo, setInspectInfo] = useState(null);
 
   return (
@@ -183,7 +199,11 @@ export default function BaseMap({
         center={[44, -123]}
         zoom={7}
         scrollWheelZoom={true}
-        style={{ width: "100%", height: "100%" }}
+        className="vmrc-map"
+        style={{
+          width: "100%",
+          height: "100%",
+        }}
       >
         {/* Basemap Layers */}
         <LayersControl position="topright">
@@ -205,14 +225,15 @@ export default function BaseMap({
           <GeoJSON
             data={globalAoi}
             style={{
-              color: "#00BFFF",       // bright aqua blue outline
-              weight: 3,              // thicker border
-              fillColor: "#00BFFF",   // light fill
-              fillOpacity: 0.05       // slightly visible but not covering map
+              color: "#00BFFF", // bright aqua blue outline
+              weight: 3,
+              fillColor: "#00BFFF",
+              fillOpacity: 0.05,
             }}
           />
         )}
 
+        
 
         {/* User Clip (temporary) */}
         {userClip && (
@@ -222,60 +243,40 @@ export default function BaseMap({
           />
         )}
 
-        {/* Raster overlay */}
+        {/* Raster overlay from backend-clipped PNG */}
         <RasterOverlay overlayUrl={overlayUrl} bounds={overlayBounds} />
 
         {/* Drawing tools + legend */}
         <MapTools onUserClipChange={onUserClipChange} />
         <LegendControl />
 
-        {/* Inspector click handler */}
-        <MapInspector
+        {/* Click sampler for real .tif value */}
+        <ClickSampler
           activeRasterId={activeRasterId}
-          onValueLoaded={setInspectInfo}
+          overlayBounds={overlayBounds}
+          onSample={setInspectInfo}
         />
 
-        {/* Floating tooltip at clicked location */}
-        {inspectInfo && inspectInfo.isValid && (
-          <Marker position={[inspectInfo.lat, inspectInfo.lon]}>
-            <Tooltip
-              permanent
-              direction="top"
-              offset={[0, -20]}
-              className="inspect-tooltip"
-            >
-              <div className="inspect-tooltip-inner">
-                <div className="inspect-title">Location</div>
-                <div className="inspect-line">
-                  Lat: {inspectInfo.lat.toFixed(4)}
-                </div>
-                <div className="inspect-line">
-                  Lon: {inspectInfo.lon.toFixed(4)}
-                </div>
-                <div className="inspect-line">
-                  Value: {inspectInfo.value.toFixed(2)}
-                </div>
+        {/* Small info card in the map (top-left) with last sampled point */}
+        {inspectInfo && !inspectInfo.isNoData && (
+          <div className="leaflet-top leaflet-right">
+            <div className="info-card">
+              <div className="info-title">Sampled point</div>
+              <div className="info-line">
+                <strong>Lat:</strong> {inspectInfo.lat.toFixed(4)}
               </div>
-            </Tooltip>
-          </Marker>
+              <div className="info-line">
+                <strong>Lon:</strong> {inspectInfo.lon.toFixed(4)}
+              </div>
+              <div className="info-line">
+                <strong>Value:</strong>{" "}
+                {inspectInfo.value == null
+                  ? "No data"
+                  : inspectInfo.value.toFixed(2)}
+              </div>
+            </div>
+          </div>
         )}
-
-        {/* Permanent VMRC AOI */}
-        {globalAoi && (
-          <GeoJSON
-            data={globalAoi}
-            style={{ color: "#22c55e", weight: 3, fillOpacity: 0 }}
-          />
-        )}
-
-        {/* User-uploaded AOI (extra layer) */}
-        {uploadedAoi && (
-          <GeoJSON
-            data={uploadedAoi}
-            style={{ color: "#eab308", weight: 2, fillOpacity: 0 }}
-          />
-        )}
-
       </MapContainer>
     </div>
   );

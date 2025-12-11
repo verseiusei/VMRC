@@ -163,3 +163,37 @@ def clip_raster_for_layer(raster_layer_id: int, user_clip_geojson: dict):
         "values": pixel_list,   # alias so frontend can use either
     }
 
+# -----------------------------------------
+# SAMPLE SINGLE VALUE AT LON / LAT
+# -----------------------------------------
+def sample_raster_value(raster_layer_id: int, lon: float, lat: float):
+    """
+    Get raster value at a given lon/lat.
+
+    NOTE: Assumes raster CRS is geographic (e.g. EPSG:4269).
+    If you later use projected rasters, you'll want to reproject
+    the (lon, lat) into the raster's CRS before sampling.
+    """
+    raster_path = resolve_raster_path(raster_layer_id)
+
+    with rasterio.open(raster_path) as src:
+        # Use rasterio's sampling at a single point
+        # (x = lon, y = lat)
+        sample = list(src.sample([(lon, lat)]))[0]
+
+        # If multi-band, just take the first band (or mean if you prefer)
+        value = float(sample[0])
+
+        nodata = src.nodata
+        if nodata is not None and value == nodata:
+            return {
+                "value": None,
+                "is_nodata": True,
+                "crs": src.crs.to_string() if src.crs else None,
+            }
+
+        return {
+            "value": value,
+            "is_nodata": False,
+            "crs": src.crs.to_string() if src.crs else None,
+        }

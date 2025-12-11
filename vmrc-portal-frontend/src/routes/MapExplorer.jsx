@@ -230,28 +230,29 @@ const handleGenerate = async (layerId, clipGeoJson) => {
   // ======================================================
   // AOI UPLOAD
   // ======================================================
-  async function handleUploadAoi(event) {
-    const file = event.target.files?.[0];
-    if (!file) return;
+async function handleUploadAoi(event) {
+  const file = event.target.files?.[0];
+  if (!file) return;
 
-    setAoiFileName(file.name);
+  const formData = new FormData();
+  formData.append("file", file);
 
-    const formData = new FormData();
-    formData.append("file", file);
+  try {
+    const res = await fetch("http://127.0.0.1:8000/api/v1/aoi/upload", {
+      method: "POST",
+      body: formData,
+    });
 
-    try {
-      const res = await fetch("http://127.0.0.1:8000/api/v1/aoi/upload", {
-        method: "POST",
-        body: formData,
-      });
+    const data = await res.json();
+    const geo = data.geojson ?? data;
 
-      const data = await res.json();
-      setGlobalAoi(data.geojson);
-    } catch (err) {
-      console.error(err);
-      alert("AOI upload failed.");
-    }
+    setUploadedAois(prev => [...prev, geo]);   // ADD, not REPLACE
+  } catch (err) {
+    console.error(err);
+    alert("AOI upload failed.");
   }
+}
+
 
   // Tabs
   const tabs = [

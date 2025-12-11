@@ -155,3 +155,21 @@ export async function getRasterValueAt({ rasterLayerId, lat, lon }) {
   console.log("[rasterApi] getRasterValueAt parsed JSON:", data);
   return data;
 }
+
+export async function sampleRasterValue({ rasterLayerId, lat, lng }) {
+  const res = await fetch("http://127.0.0.1:8000/api/v1/rasters/sample", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      rasterLayerId,
+      lon: lng,
+      lat,
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error("Failed to sample raster value");
+  }
+
+  return res.json();
+}

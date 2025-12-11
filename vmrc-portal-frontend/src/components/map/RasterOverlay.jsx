@@ -13,6 +13,7 @@ export default function RasterOverlay({ overlayUrl, bounds }) {
     ? overlayUrl
     : `${BACKEND_BASE}${overlayUrl}`;
 
+  // Convert object bounds -> Leaflet bounds array
   const leafletBounds = [
     [bounds.south, bounds.west],
     [bounds.north, bounds.east],
@@ -20,10 +21,11 @@ export default function RasterOverlay({ overlayUrl, bounds }) {
 
   return (
     <ImageOverlay
-      url={fullUrl}          // ✔ FIXED
+      url={fullUrl}
       bounds={leafletBounds}
-      opacity={1}
-      className="vmrc-raster-overlay"
+      opacity={1.0}
+      interactive={false} // let clicks pass through to map
+      zIndex={200}
     />
   );
 }
