@@ -143,10 +143,31 @@ body {
 /* LEFT PANEL */
 /* FORCE SIDEBAR ABOVE MAP */
 .panel-left {
-  position: relative;
-  z-index: 3000 !important;
-  pointer-events: auto !important;
+  height: 100vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 6px;
 }
+
+/* Modern thin scrollbar */
+.panel-left::-webkit-scrollbar {
+  width: 6px;
+}
+
+.panel-left::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.panel-left::-webkit-scrollbar-thumb {
+  background: #4b5563;     /* soft gray */
+  border-radius: 4px;
+}
+
+.panel-left::-webkit-scrollbar-thumb:hover {
+  background: #6b7280;     /* slightly lighter */
+}
+
+
 
 /* FORCE MAP TO STAY BELOW UI PANELS */
 .panel-map,
@@ -239,7 +260,6 @@ body {
   width: 100%;
   height: 100%;
   border-radius: 12px;
-  overflow: hidden;
 }
 
 .leaflet-container {
@@ -722,11 +742,14 @@ body {
 }
 
 .inspect-tooltip {
-  background: transparent;
-  border: none;
-  box-shadow: none;
-  padding: 0;
+  background: #020617 !important;
+  border: 1px solid rgba(255,255,255,0.3) !important;
+  border-radius: 6px;
+  padding: 4px 6px;
+  color: white !important;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.6);
 }
+
 
 .inspect-tooltip-inner {
   background: #020617;           /* dark navy */
@@ -970,24 +993,25 @@ body {
 }
 
 .inspect-tooltip {
-  background: #020617;
-  border-radius: 8px;
-  border: 1px solid rgba(148, 163, 184, 0.6);
-  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.8);
-  padding: 6px 8px;
+  background: #020617 !important;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 6px;
+  padding: 4px 6px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.6);
+  color: #fff;
 }
 
 .inspect-tooltip-inner {
   font-size: 11px;
-  color: #e5e7eb;
 }
 
 .inspect-title {
   font-weight: 600;
-  margin-bottom: 4px;
+  margin-bottom: 3px;
   color: #facc15;
 }
 
-.inspect-line {
-  line-height: 1.3;
+/* FORCE TOOLTIP ABOVE ALL UI PANELS */
+.leaflet-tooltip {
+  z-index: 100000 !important;
 }

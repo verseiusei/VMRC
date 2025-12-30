@@ -61,163 +61,149 @@ export default function HistogramPanel({ values, pixels, pixelValues }) {
 
   console.log("[Histogram] bins:", binCounts, "total pixels:", total);
 
-  return (
-    <div className="panel-body">
-      <h3 className="section-title">Value % Histogram</h3>
-      <p className="section-help">
-        Distribution of pixel values (0–100%), grouped in 10% bins.
-      </p>
+return (
+  <div className="panel-body">
+    <h3 className="section-title">Value % Histogram</h3>
+    <p className="section-help">
+      Distribution of pixel values (0–100%), grouped in 10% bins.
+    </p>
 
-      {/* Outer box for histogram */}
+    {/* Outer box */}
+    <div
+      style={{
+        marginTop: 10,
+        padding: "8px 10px 10px",
+        background:
+          "linear-gradient(180deg, rgba(255,255,255,0.03), rgba(0,0,0,0.12))",
+        borderRadius: 10,
+      }}
+    >
+      {/* Y-axis + Bars */}
       <div
         style={{
-          marginTop: 10,
-          padding: "8px 10px 10px",
-          background:
-            "linear-gradient(180deg, rgba(255,255,255,0.03), rgba(0,0,0,0.12))",
-          borderRadius: 10,
+          display: "flex",
+          gap: 10,
+          height: 220,
         }}
       >
-        {/* Y-axis + bars area */}
+        {/* Y-gridlines */}
         <div
           style={{
+            width: 26,
             display: "flex",
-            gap: 10,
-            height: 220,
+            flexDirection: "column",
+            justifyContent: "space-between",
+            alignItems: "flex-end",
+            paddingRight: 4,
           }}
         >
-          {/* Y-axis (0,25,50,75,100 %) */}
-          <div
-            style={{
-              width: 32,
-              display: "flex",
-              flexDirection: "column",
-              justifyContent: "space-between",
-              alignItems: "flex-end",
-              fontSize: 11,
-              color: "#cbd5f5",
-            }}
-          >
-            {[100, 75, 50, 25, 0].map((v) => (
+          {[100, 75, 50, 25, 0].map((v) => (
+            <div
+              key={v}
+              style={{
+                width: "100%",
+                height: 1,
+                backgroundColor: "rgba(255,255,255,0.08)",
+              }}
+            />
+          ))}
+        </div>
+
+        {/* Bars */}
+        <div
+          style={{
+            flex: 1,
+            display: "flex",
+            alignItems: "flex-end",
+            gap: 6,
+          }}
+        >
+          {binCounts.map((count, i) => {
+            const fraction = count / total;
+            const color = BAR_COLORS[i];
+            const label = count > 0 ? `${(fraction * 100).toFixed(1)}%` : "";
+            const barHeight = Math.max(8, (fraction / maxFraction) * 180);
+
+            return (
               <div
-                key={v}
+                key={i}
                 style={{
+                  flex: 1,
                   display: "flex",
+                  flexDirection: "column",
                   alignItems: "center",
-                  gap: 4,
+                  justifyContent: "flex-end",
+                  height: "100%",
                 }}
               >
                 <div
                   style={{
-                    width: 10,
-                    height: 1,
-                    backgroundColor: "rgba(203, 213, 245, 0.6)",
-                  }}
-                />
-                <span>{v}</span>
-              </div>
-            ))}
-          </div>
-
-          {/* Bars */}
-          <div
-            style={{
-              flex: 1,
-              display: "flex",
-              alignItems: "flex-end",
-              gap: 6,
-            }}
-          >
-            {binCounts.map((count, i) => {
-              const fraction = count / total; // 0–1
-              const color = BAR_COLORS[i];
-              const label =
-                count > 0 ? `${(fraction * 100).toFixed(1)}%` : "";
-
-              // bar height in px (max 180px)
-              const barHeight = Math.max(
-                8, // minimum visible
-                (fraction / maxFraction) * 180
-              );
-
-              return (
-                <div
-                  key={i}
-                  style={{
-                    flex: 1,
-                    display: "flex",
-                    flexDirection: "column",
-                    alignItems: "center",
-                    justifyContent: "flex-end",
-                    height: "100%",
+                    fontSize: 10,
+                    color: "#e5e7ff",
+                    marginBottom: 4,
+                    minHeight: 14,
                   }}
                 >
-                  {/* Text above bar: percent of area in this bin */}
-                  <div
-                    style={{
-                      fontSize: 10,
-                      color: "#e5e7ff",
-                      marginBottom: 4,
-                      minHeight: 14,
-                    }}
-                  >
-                    {label}
-                  </div>
-
-                  {/* Colored bar */}
-                  <div
-                    style={{
-                      width: "100%",
-                      height: barHeight,
-                      backgroundColor: color,
-                      borderRadius: "4px 4px 0 0",
-                      border: "1px solid rgba(0,0,0,0.45)",
-                      boxShadow: "0 0 4px rgba(0,0,0,0.6)",
-                    }}
-                    title={`${count} pixels in ${BIN_EDGES[i]}–${
-                      BIN_EDGES[i + 1]
-                    }% (${label || "0%"})`}
-                  />
+                  {label}
                 </div>
-              );
-            })}
-          </div>
-        </div>
 
-        {/* X-axis ticks */}
-        <div
-          style={{
-            marginTop: 10,
-            display: "flex",
-            justifyContent: "space-between",
-          }}
-        >
-          {BIN_EDGES.map((edge, i) => (
-            <div
-              key={i}
-              style={{
-                flex: 1,
-                textAlign: "center",
-                fontSize: 11,
-                color: "#cbd5f5",
-              }}
-            >
-              {edge}
-            </div>
-          ))}
-        </div>
-
-        <div
-          style={{
-            marginTop: 4,
-            textAlign: "center",
-            fontSize: 12,
-            color: "#cbd5f5",
-          }}
-        >
-          Value (%)
+                <div
+                  style={{
+                    width: "100%",
+                    height: barHeight,
+                    backgroundColor: color,
+                    borderRadius: "4px 4px 0 0",
+                    border: "1px solid rgba(0,0,0,0.45)",
+                    boxShadow: "0 0 4px rgba(0,0,0,0.6)",
+                  }}
+                  title={`${count} pixels in ${BIN_EDGES[i]}–${BIN_EDGES[i + 1]}% (${label || "0%"})`}
+                />
+              </div>
+            );
+          })}
         </div>
       </div>
+
+      {/* X-axis ticks */}
+
+<div
+  style={{
+    marginTop: 10,
+    width: "100%",
+    display: "flex",
+    justifyContent: "space-between",
+    padding: "0 6px",
+  }}
+>
+  {BIN_EDGES.slice(1).map((edge, i) => (
+    <div
+      key={i}
+      style={{
+        flex: 1,
+        textAlign: "center",
+        fontSize: 11,
+        color: "#cbd5f5",
+      }}
+    >
+      {edge}
     </div>
-  );
+  ))}
+</div>
+
+
+
+      {/* X-axis label */}
+      <div
+        style={{
+          marginTop: 16,
+          textAlign: "center",
+          fontSize: 12,
+          color: "#cbd5f5",
+        }}
+      >
+        Value (%)
+      </div>
+    </div>
+  </div>
+);
 }

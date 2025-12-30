@@ -16,6 +16,7 @@ export default function MapExplorer() {
   // ======================================================
   const [globalAoi, setGlobalAoi] = useState(null);
   const [userClip, setUserClip] = useState(null);
+  const [uploadedAois, setUploadedAois] = useState([]);
 
   const [overlayUrl, setOverlayUrl] = useState(null);
   const [overlayBounds, setOverlayBounds] = useState(null);
@@ -46,6 +47,8 @@ export default function MapExplorer() {
   const [exportPng, setExportPng] = useState(true);
   const [exportTif, setExportTif] = useState(false);
   const [exportCsv, setExportCsv] = useState(false);
+  const [filename, setFilename] = useState("");
+
 
   // AOI upload
   const [aoiFileName, setAoiFileName] = useState("");
@@ -191,7 +194,7 @@ const handleGenerate = async (layerId, clipGeoJson) => {
   // ======================================================
   // EXPORT RESULT
   // ======================================================
-  async function handleExport(formats) {
+  async function handleExport({ formats, filename }) {
     if (!userClip) {
       alert("Draw a clip region before exporting.");
       return;
@@ -208,6 +211,7 @@ const handleGenerate = async (layerId, clipGeoJson) => {
         rasterLayerId,
         userClipGeoJSON: userClip,
         formats,
+        filename,   // ❤️ send to backend
       });
 
       const links = [];
@@ -234,6 +238,8 @@ async function handleUploadAoi(event) {
   const file = event.target.files?.[0];
   if (!file) return;
 
+  setAoiFileName(file.name); // <-- update UI
+
   const formData = new FormData();
   formData.append("file", file);
 
@@ -246,7 +252,9 @@ async function handleUploadAoi(event) {
     const data = await res.json();
     const geo = data.geojson ?? data;
 
-    setUploadedAois(prev => [...prev, geo]);   // ADD, not REPLACE
+    // Add uploaded AOI to list
+    setUploadedAois(prev => [...prev, geo]);
+
   } catch (err) {
     console.error(err);
     alert("AOI upload failed.");
@@ -325,7 +333,7 @@ async function handleUploadAoi(event) {
 
         {/* UNUSED BUT PRESENT IN UI */}
         <div className="filter-block">
-          <label>High Stress Level (Scenario)</label>
+          <label>High Stress Level</label>
           <select
             value={stressScenario}
             onChange={(e) => setStressScenario(e.target.value)}
@@ -393,6 +401,18 @@ async function handleUploadAoi(event) {
         <div className="filter-section">
           <h3 className="section-title">Export Results</h3>
           <p className="section-help">Save clipped raster and statistics.</p>
+          {/* Filename Input */}
+          <div className="sidebar-field" style={{ marginBottom: "14px" }}>
+            <label className="sidebar-label">Filename (optional)</label>
+            <input
+              type="text"
+              className="input"
+              placeholder="e.g., dry_df_04"
+              value={filename}
+              onChange={(e) => setFilename(e.target.value)}
+            />
+            <p className="sidebar-help">Leave empty for automatic naming.</p>
+          </div>
 
           <label className="checkbox-row">
             <input
@@ -426,12 +446,17 @@ async function handleUploadAoi(event) {
             disabled={!userClip}
             onClick={() =>
               handleExport(
-                [
-                  exportPng ? "png" : null,
-                  exportTif ? "tif" : null,
-                  exportCsv ? "csv" : null,
-                ].filter(Boolean)
+                {
+                  formats: [
+                    exportPng ? "png" : null,
+                    exportTif ? "tif" : null,
+                    exportCsv ? "csv" : null,
+                  ].filter(Boolean),
+
+                  filename: filename.trim() || null, 
+                }
               )
+
             }
             style={{ opacity: userClip ? 1 : 0.5 }}
           >
@@ -444,12 +469,14 @@ async function handleUploadAoi(event) {
       <section className="panel-map card">
         <BaseMap
           globalAoi={globalAoi}
+          uploadedAois={uploadedAois}
           userClip={userClip}
           overlayUrl={overlayUrl}
           overlayBounds={overlayBounds}
           onUserClipChange={handleUserClipChange}
           activeRasterId={activeRasterId}
         />
+
       </section>
 
       {/* RIGHT PANEL */}

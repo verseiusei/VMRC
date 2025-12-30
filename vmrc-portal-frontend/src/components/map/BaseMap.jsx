@@ -23,6 +23,8 @@ import {
   LayersControl,
   useMap,
   useMapEvents,
+  Marker,
+  Tooltip
 } from "react-leaflet";
 
 import "leaflet/dist/leaflet.css";
@@ -134,6 +136,8 @@ function LegendControl() {
   );
 }
 
+
+
 // ======================================================
 // CLICK SAMPLER – real .tif value, only after clip
 // ======================================================
@@ -185,12 +189,14 @@ function ClickSampler({ activeRasterId, overlayBounds, onSample }) {
 // ======================================================
 export default function BaseMap({
   globalAoi,
+  uploadedAois = [],
   userClip,
   overlayUrl,
   overlayBounds,
   onUserClipChange,
   activeRasterId,
-}) {
+})
+ {
   const [inspectInfo, setInspectInfo] = useState(null);
 
   return (
@@ -233,6 +239,19 @@ export default function BaseMap({
           />
         )}
 
+        {/* Uploaded AOIs */}
+        {uploadedAois.map((aoi, i) => (
+          <GeoJSON
+            key={`uploaded-${i}`}
+            data={aoi}
+            style={{
+              color: "#f97316",       // orange outline
+              weight: 2,
+              fillOpacity: 0.15,
+            }}
+          />
+        ))}
+
         
 
         {/* User Clip (temporary) */}
@@ -259,25 +278,25 @@ export default function BaseMap({
 
         {/* Small info card in the map (top-left) with last sampled point */}
         {inspectInfo && !inspectInfo.isNoData && (
-          <div className="leaflet-top leaflet-right">
-            <div className="info-card">
-              <div className="info-title">Sampled point</div>
-              <div className="info-line">
-                <strong>Lat:</strong> {inspectInfo.lat.toFixed(4)}
+          <Marker position={[inspectInfo.lat, inspectInfo.lon]}>
+            <Tooltip
+              permanent
+              direction="top"
+              offset={[0, -18]}
+              className="inspect-tooltip"
+            >
+              <div className="inspect-tooltip-inner">
+                <div className="inspect-title">Location Info</div>
+                <div className="inspect-line"><strong>Lat:</strong> {inspectInfo.lat.toFixed(4)}</div>
+                <div className="inspect-line"><strong>Lon:</strong> {inspectInfo.lon.toFixed(4)}</div>
+                <div className="inspect-line"><strong>Value:</strong> {inspectInfo.value.toFixed(2)}</div>
               </div>
-              <div className="info-line">
-                <strong>Lon:</strong> {inspectInfo.lon.toFixed(4)}
-              </div>
-              <div className="info-line">
-                <strong>Value:</strong>{" "}
-                {inspectInfo.value == null
-                  ? "No data"
-                  : inspectInfo.value.toFixed(2)}
-              </div>
-            </div>
-          </div>
+            </Tooltip>
+          </Marker>
         )}
+
       </MapContainer>
     </div>
   );
 }
+
