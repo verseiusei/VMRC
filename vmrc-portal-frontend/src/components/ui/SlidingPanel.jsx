@@ -23,17 +23,18 @@ export default function SlidingPanel({ width = 350, children }) {
         className="sliding-panel"
         style={{
           width: `${panelWidth}px`,
+          minWidth: `${panelWidth}px`, // Prevent collapse when width is 0
         }}
       >
         {/* Only render content when open to avoid weird overflow */}
         {open && <div className="sliding-panel-inner">{children}</div>}
       </div>
 
-      {/* The TOGGLE BUTTON (outside / attached to panel edge) */}
+      {/* The TOGGLE BUTTON (fixed position, outside grid) */}
       <button
         className="panel-toggle-button"
         style={{
-          right: open ? width : 0, // when open: sits on panel edge; when closed: screen edge
+          right: open ? `calc(18px + ${width}px)` : '18px', // Account for grid gap when open
         }}
         onClick={() => setOpen((prev) => !prev)}
         aria-label="Toggle side panel"

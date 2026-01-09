@@ -29,6 +29,7 @@ export async function fetchGlobalAOI() {
  * Backend endpoint: POST /api/v1/rasters/clip
  */
 export async function clipRaster({ rasterLayerId, userClipGeoJSON }) {
+
   const res = await fetch("http://127.0.0.1:8000/api/v1/rasters/clip", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -78,11 +79,13 @@ export async function uploadAOI(file) {
 }
 
 
-export async function exportRaster({ rasterLayerId, userClipGeoJSON, formats }) {
+export async function exportRaster({ rasterLayerId, userClipGeoJSON, formats, filename, context }) {
   console.log("[rasterApi] exportRaster() called with:", {
     rasterLayerId,
     userClipGeoJSON,
     formats,
+    filename,
+    context,
   });
 
   let res;
@@ -93,7 +96,9 @@ export async function exportRaster({ rasterLayerId, userClipGeoJSON, formats }) 
       body: JSON.stringify({
         raster_layer_id: rasterLayerId,
         user_clip_geojson: userClipGeoJSON,
-        formats,
+        formats: formats || [],
+        filename: filename || null,
+        context: context || {},
       }),
     });
   } catch (err) {
