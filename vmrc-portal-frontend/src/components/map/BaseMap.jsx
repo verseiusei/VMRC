@@ -15,7 +15,7 @@ L.Icon.Default.mergeOptions({
   shadowUrl: shadow,
 });
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import {
   MapContainer,
   TileLayer,
@@ -35,6 +35,73 @@ import { sampleRasterValue } from "../../lib/rasterApi";
 import RasterOverlay from "./RasterOverlay";
 
 // ======================================================
+// UPLOADED AOI LAYER - Non-editable, protected from Geoman
+// ======================================================
+function UploadedAOILayer({ data, index }) {
+  const map = useMap();
+  const layerRef = useRef(null);
+
+  useEffect(() => {
+    if (!map || !layerRef.current) return;
+
+    const layer = layerRef.current.leafletElement;
+    if (!layer) return;
+
+    // Prevent Geoman from attaching to this layer
+    // Mark layer so Geoman knows to ignore it
+    layer._pmIgnore = true;
+
+    // Disable Geoman if it's already attached
+    if (layer.pm) {
+      layer.pm.disable();
+      // Prevent re-enabling
+      const originalEnable = layer.pm.enable;
+      layer.pm.enable = function() {
+        console.warn("Attempted to enable Geoman on uploaded AOI - ignored");
+        return this;
+      };
+    }
+
+    // Also handle child layers (for MultiPolygon, FeatureCollection with multiple features)
+    if (layer.eachLayer) {
+      layer.eachLayer((sublayer) => {
+        sublayer._pmIgnore = true;
+        if (sublayer.pm) {
+          sublayer.pm.disable();
+        }
+      });
+    }
+
+    // Listen for Geoman trying to attach and prevent it
+    const preventGeoman = () => {
+      if (layer.pm) {
+        layer.pm.disable();
+      }
+    };
+
+    map.on("pm:create", preventGeoman);
+    map.on("pm:globaleditmodetoggled", preventGeoman);
+
+    return () => {
+      map.off("pm:create", preventGeoman);
+      map.off("pm:globaleditmodetoggled", preventGeoman);
+    };
+  }, [map, data]);
+
+  return (
+    <GeoJSON
+      ref={layerRef}
+      data={data}
+      style={{
+        color: "#f97316", // orange outline
+        weight: 2,
+        fillOpacity: 0.15,
+      }}
+    />
+  );
+}
+
+// ======================================================
 // CUSTOM DRAWING TOOLBOX (user clip only, AOI stays)
 // ======================================================
 function MapTools({ onUserClipChange }) {
@@ -47,29 +114,77 @@ function MapTools({ onUserClipChange }) {
 
     map.pmInitialized = true;
 
-    // Turn on only Polygon + Rectangle
+    // Enable draw tools (polygon + rectangle) and removal mode (ERASE)
+    // Disable all edit-related tools completely
+    // IMPORTANT: This is the ONLY addControls call - no overwriting
     map.pm.addControls({
       position: "topleft",
+      // Enable draw tools
+      drawPolygon: true,
+      drawRectangle: true,
+      // Enable removal mode (ERASE/trash button) - MUST be true
+      removalMode: true,
+      // Disable all other draw tools
       drawMarker: false,
       drawCircle: false,
       drawPolyline: false,
       drawCircleMarker: false,
       drawText: false,
+      editControls: true,
+      editMode: false,
       dragMode: false,
-      cutPolygon: false,
       rotateMode: false,
+      cutPolygon: false,
+ // Disable edit mode completely
     });
 
-    // Remove any stray Geoman weird buttons like T / Rotate
-    if (map.pm.Toolbar) {
-      try {
-        map.pm.Toolbar.removeControl("Text");
-        map.pm.Toolbar.removeControl("RotateMode");
-        map.pm.Toolbar.removeControl("Cut");
-      } catch {
-        // ignore
+    // Remove unwanted controls BUT preserve RemovalMode (erase tool)
+    // Wait a moment for toolbar to initialize before removing controls
+    setTimeout(() => {
+      if (map.pm && map.pm.Toolbar) {
+        try {
+          // Remove unwanted controls
+          map.pm.Toolbar.removeControl("Text");
+          map.pm.Toolbar.removeControl("RotateMode");
+          map.pm.Toolbar.removeControl("Cut");
+          // Remove edit controls if they exist
+          map.pm.Toolbar.removeControl("EditMode");
+          map.pm.Toolbar.removeControl("editMode");
+          map.pm.Toolbar.removeControl("edit");
+          
+          // Verify RemovalMode control exists and is enabled
+          // Try different possible control names
+          const controlNames = ["RemovalMode", "removalMode", "Remove", "Delete", "Erase"];
+          let foundControl = null;
+          
+          for (const name of controlNames) {
+            try {
+              const control = map.pm.Toolbar.getControl(name);
+              if (control) {
+                foundControl = control;
+                console.log(`✓ RemovalMode (erase) control found as "${name}"`);
+                break;
+              }
+            } catch (e) {
+              // Try next name
+            }
+          }
+          
+          if (!foundControl) {
+            // List all available controls for debugging
+            try {
+              const allControls = map.pm.Toolbar._toolbars;
+              console.warn("⚠ RemovalMode control not found. Available controls:", Object.keys(allControls || {}));
+            } catch (e) {
+              console.warn("⚠ Could not list available controls");
+            }
+            console.warn("⚠ Make sure removalMode: true is set in addControls()");
+          }
+        } catch (err) {
+          console.warn("Error managing Geoman toolbar controls:", err);
+        }
       }
-    }
+    }, 200);
 
     // When a new shape is created
     map.on("pm:create", (e) => {
@@ -100,43 +215,217 @@ function MapTools({ onUserClipChange }) {
 }
 
 // ======================================================
-// LEGEND (Discrete Color Ramp)
+// LEGEND (Discrete Color Ramp) - Always visible
 // ======================================================
 const LEGEND_ITEMS = [
   { color: "#006400", label: "0–10" },
   { color: "#228B22", label: "10–20" },
-  { color: "#6B8E23", label: "20–30" },
-  { color: "#9ACD32", label: "30–40" },
-  { color: "#FFD700", label: "40–50" },
-  { color: "#FFC000", label: "50–60" },
-  { color: "#FFA500", label: "60–70" },
-  { color: "#FF8C00", label: "70–80" },
-  { color: "#FF4500", label: "80–90" },
+  { color: "#9ACD32", label: "20–30" },
+  { color: "#FFD700", label: "30–40" },
+  { color: "#FFA500", label: "40–50" },
+  { color: "#FF8C00", label: "50–60" },
+  { color: "#FF6B00", label: "60–70" },
+  { color: "#FF4500", label: "70–80" },
+  { color: "#DC143C", label: "80–90" },
   { color: "#B22222", label: "90–100" },
 ];
 
+// ======================================================
+// LEGEND CONTROL – Persistent Leaflet Control
+// Always visible from page load, static reference legend
+// Uses useRef to persist across React StrictMode double renders
+// ======================================================
 function LegendControl() {
-  useMap();
+  const map = useMap();
+  const controlRef = useRef(null);
+  const containerRef = useRef(null);
 
-  return (
-    <div className="leaflet-top leaflet-left" style={{ marginTop: "240px" }}>
-      <div className="leaflet-control legend-card">
-        <div className="legend-title">Value (%)</div>
-        {LEGEND_ITEMS.map((item) => (
-          <div className="legend-row" key={item.label}>
-            <span
-              className="legend-swatch"
-              style={{ backgroundColor: item.color }}
-            />
-            <span className="legend-label">{item.label}</span>
+  // Create control once - persist using useRef to prevent flicker in StrictMode
+  useEffect(() => {
+    if (!map) return;
+    
+    // Only create if it doesn't exist
+    if (controlRef.current) return;
+
+    // Create custom Leaflet Control
+    const VMRCLegendControl = L.Control.extend({
+      onAdd: function(map) {
+        const container = L.DomUtil.create('div', 'leaflet-control vmrc-legend');
+        container.style.pointerEvents = 'none';
+        container.style.zIndex = '1000';
+        containerRef.current = container;
+        
+        // Build static legend HTML - always show bins, no conditional content
+        const legendHTML = `
+          <div class="legend-card">
+            <div class="legend-title">Value (%)</div>
+            ${LEGEND_ITEMS.map((item) => `
+              <div class="legend-row">
+                <span class="legend-swatch" style="background-color: ${item.color}; pointer-events: none;"></span>
+                <span class="legend-label" style="pointer-events: none;">${item.label}</span>
+              </div>
+            `).join('')}
           </div>
-        ))}
-      </div>
-    </div>
-  );
+        `;
+        
+        container.innerHTML = legendHTML;
+        return container;
+      },
+      onRemove: function(map) {
+        // Cleanup handled by React
+      }
+    });
+
+    // Create and add control - only once
+    const control = new VMRCLegendControl({ position: 'topleft' });
+    control.addTo(map);
+    controlRef.current = control;
+
+    // Don't remove in cleanup - let it persist
+    // Only remove if map is actually unmounting (handled by Leaflet)
+  }, [map]); // Only depend on map
+
+  return null; // Control is managed by Leaflet, not React
 }
 
 
+
+// ======================================================
+// MAP REF HANDLER – Expose map instance to parent
+// ======================================================
+function MapRefHandler({ onMapReady }) {
+  const map = useMap();
+  
+  useEffect(() => {
+    if (map && onMapReady) {
+      onMapReady(map);
+    }
+  }, [map, onMapReady]);
+
+  return null;
+}
+
+// ======================================================
+// RASTER QUALITY CONTROL – Persistent Leaflet Control
+// Only visible when raster exists, updates only on zoomend to prevent flicker
+// Uses useRef to persist across React StrictMode double renders
+// ======================================================
+function RasterQualityControl({ overlayUrl, overlayBounds }) {
+  const map = useMap();
+  const controlRef = useRef(null);
+  const containerRef = useRef(null);
+
+  // Raster pixel size: ~700-800m (average 750m)
+  const RASTER_PIXEL_SIZE_M = 750;
+
+  const hasRaster = overlayUrl && overlayBounds;
+
+  // Create/remove control based on raster state - persist using useRef
+  useEffect(() => {
+    if (!map) return;
+
+    if (!hasRaster) {
+      // Remove control if it exists and no raster
+      if (controlRef.current) {
+        map.removeControl(controlRef.current);
+        controlRef.current = null;
+        containerRef.current = null;
+      }
+      return;
+    }
+
+    // Only create if it doesn't exist
+    if (controlRef.current) return;
+
+    // Create custom Leaflet Control only when raster exists
+    const QualityControl = L.Control.extend({
+      onAdd: function(map) {
+        const container = L.DomUtil.create('div', 'leaflet-control zoom-resolution-indicator');
+        container.style.pointerEvents = 'none';
+        container.style.zIndex = '1000';
+        containerRef.current = container;
+        return container;
+      },
+      onRemove: function(map) {
+        // Cleanup handled by React
+      }
+    });
+
+    // Create and add control - only once
+    const control = new QualityControl({ position: 'bottomright' });
+    control.addTo(map);
+    controlRef.current = control;
+
+    // No cleanup needed - effect body handles removal when hasRaster becomes false
+    // Control persists using useRef to prevent flicker in StrictMode
+  }, [map, hasRaster]);
+
+  // Update content function - only called when raster exists
+  const updateContent = useCallback(() => {
+    if (!containerRef.current || !hasRaster) return;
+
+    const zoom = map.getZoom();
+    const center = map.getCenter();
+    
+    // Calculate meters per screen pixel
+    const metersPerScreenPixel = (156543.03392 * Math.cos(center.lat * Math.PI / 180)) / Math.pow(2, zoom);
+    
+    // Calculate how big one raster pixel appears on screen
+    const pixelScreenSize = RASTER_PIXEL_SIZE_M / metersPerScreenPixel;
+
+    // Determine status
+    let status;
+    if (pixelScreenSize <= 30) {
+      status = "good";
+    } else if (pixelScreenSize <= 80) {
+      status = "warning";
+    } else {
+      status = "error";
+    }
+
+    const statusConfig = {
+      good: { color: "#10b981", text: "True to size", label: "GOOD" },
+      warning: { color: "#f59e0b", text: "Getting blocky", label: "WARNING" },
+      error: { color: "#ef4444", text: "Too zoomed in — pixels huge", label: "ERROR" },
+    };
+
+    const config = statusConfig[status];
+
+    // Update DOM directly to avoid React re-renders
+    containerRef.current.innerHTML = `
+      <div class="zoom-resolution-badge zoom-resolution-${status}" style="border-left-color: ${config.color}; pointer-events: none;">
+        <div class="zoom-resolution-label" style="color: ${config.color}; pointer-events: none;">
+          ${config.label}
+        </div>
+        <div class="zoom-resolution-text" style="pointer-events: none;">
+          ${config.text}
+        </div>
+        <div class="zoom-resolution-size" style="pointer-events: none;">
+          ${pixelScreenSize.toFixed(0)}px/pixel
+        </div>
+      </div>
+    `;
+  }, [map, hasRaster]);
+
+  // Update content when raster changes
+  useEffect(() => {
+    updateContent();
+  }, [updateContent]);
+
+  // Update content only on zoomend (not zoom or moveend) to prevent flicker
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    // Only listen to zoomend (not zoom or moveend) to prevent flicker
+    map.on("zoomend", updateContent);
+
+    return () => {
+      map.off("zoomend", updateContent);
+    };
+  }, [map, updateContent]);
+
+  return null; // Control is managed by Leaflet, not React
+}
 
 // ======================================================
 // CLICK SAMPLER – real .tif value, only after clip
@@ -195,6 +484,7 @@ export default function BaseMap({
   overlayBounds,
   onUserClipChange,
   activeRasterId,
+  onMapReady,
 })
  {
   const [inspectInfo, setInspectInfo] = useState(null);
@@ -239,35 +529,47 @@ export default function BaseMap({
           />
         )}
 
-        {/* Uploaded AOIs */}
+        {/* Uploaded AOIs - Non-editable, protected from Geoman */}
         {uploadedAois.map((aoi, i) => (
-          <GeoJSON
+          <UploadedAOILayer
             key={`uploaded-${i}`}
             data={aoi}
-            style={{
-              color: "#f97316",       // orange outline
-              weight: 2,
-              fillOpacity: 0.15,
-            }}
+            index={i}
           />
         ))}
 
-        
-
-        {/* User Clip (temporary) */}
+        {/* User Clip - Shows the active clip region (from upload or draw) */}
         {userClip && (
           <GeoJSON
             data={userClip}
-            style={{ color: "#38bdf8", weight: 2, fillOpacity: 0.15 }}
+            style={{
+              color: "#2563eb", // Blue outline
+              weight: 3,
+              fillColor: "#2563eb",
+              fillOpacity: 0.1,
+              dashArray: "5, 5", // Dashed line to distinguish from other AOIs
+            }}
           />
         )}
 
         {/* Raster overlay from backend-clipped PNG */}
-        <RasterOverlay overlayUrl={overlayUrl} bounds={overlayBounds} />
+        <RasterOverlay 
+          overlayUrl={overlayUrl} 
+          bounds={overlayBounds}
+        />
 
         {/* Drawing tools + legend */}
         <MapTools onUserClipChange={onUserClipChange} />
         <LegendControl />
+
+        {/* Raster quality control - persistent Leaflet control */}
+        <RasterQualityControl 
+          overlayUrl={overlayUrl}
+          overlayBounds={overlayBounds}
+        />
+
+        {/* Map ref handler */}
+        <MapRefHandler onMapReady={onMapReady} />
 
         {/* Click sampler for real .tif value */}
         <ClickSampler

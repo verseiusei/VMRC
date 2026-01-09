@@ -1,0 +1,136 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -123.169061,
+              43.663634
+            ],
+            [
+              -123.169061,
+              45.384627
+            ],
+            [
+              -119.929263,
+              45.384627
+            ],
+            [
+              -119.929263,
+              43.663634
+            ],
+            [
+              -123.169061,
+              43.663634
+            ]
+          ]
+        ]
+      },
+      "properties": {
+        "name": "User AOI",
+        "export_date": "2026-01-09T00:11:51.931279",
+        "vmrc_report": {
+          "export_date": "2026-01-09T00:11:51.482031",
+          "export_id": "0b207f8b",
+          "software": "VMRC Portal",
+          "raster": {
+            "name": "M2.5_DF_D04_l.tif",
+            "path": "D:\\VMRC_Project\\Data_Analysis!!\\Nov20\\Mortality-DEC30\\Douglas_Fir\\0\\l\\M2.5_DF_D04_l.tif"
+          },
+          "context": {
+            "mapType": "mortality",
+            "species": "Douglas-fir",
+            "coverPercent": "0",
+            "condition": "Dry",
+            "month": "04",
+            "stressLevel": "Low Stress",
+            "hslClass": null,
+            "selectedRasterName": "M2.5_DF_D04_l.tif",
+            "selectedRasterPath": "D:\\VMRC_Project\\Data_Analysis!!\\Nov20\\Mortality-DEC30\\Douglas_Fir\\0\\l\\M2.5_DF_D04_l.tif"
+          },
+          "aoi": {
+            "bounds": {
+              "west": -123.17379525248356,
+              "south": 43.661398033162314,
+              "east": -119.92379525261356,
+              "north": 45.386398033093315
+            }
+          },
+          "statistics": {
+            "min": 4.048025220981799e-05,
+            "max": 0.04613702744245529,
+            "mean": 0.009787352101505891,
+            "std": 0.007059592584773434,
+            "count": 79457,
+            "median": 0.008685849141329527,
+            "percentiles": {
+              "p10": 0.00172287633176893,
+              "p25": 0.004520198330283165,
+              "p50": 0.008685801178216934,
+              "p75": 0.013206500560045242,
+              "p90": 0.019086727872490883
+            }
+          },
+          "histogram": {
+            "bins": [
+              {
+                "range": "0-10",
+                "count": 50000,
+                "percentage": 100.0
+              },
+              {
+                "range": "10-20",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "20-30",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "30-40",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "40-50",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "50-60",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "60-70",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "70-80",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "80-90",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "90-100",
+                "count": 0,
+                "percentage": 0.0
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
