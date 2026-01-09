@@ -502,6 +502,95 @@ def clip_raster_for_layer(raster_layer_id: int, user_clip_geojson: dict):
         # We need to reshape it to match mask_valid positions
         rgb_img[mask_valid] = valid_rgb
 
+    # -----------------------------
+    # Compute histogram from REAL raster values (not PNG/RGB/alpha)
+    # -----------------------------
+    # CRITICAL: Use the exact same valid_values array that was used for colormap
+    # These are the REAL raster float values, NOT image bytes (0-255) or clamped values
+    # Bins: [0,10), [10,20), ..., [80,90), [90,100] where 100 is included in last bin
+    # This matches the classify_to_colormap binning logic exactly
+    
+    histogram_bins = np.array([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100.0001])  # 100.0001 to include 100 in last bin
+    histogram_counts = np.zeros(10, dtype=int)
+    histogram_percentages = np.zeros(10, dtype=float)
+    
+    if mask_valid.any():
+        # Use the REAL raster values - these are float values from the raster dataset
+        # DO NOT clamp or modify these values - use them as-is
+        # The classify_to_colormap function expects values in 0-100 range
+        # If values are outside this range, they should be handled by the colormap function itself
+        
+        # Log the actual raster values to verify we're using the right data
+        print(f"\n[HISTOGRAM] Using REAL raster values (not PNG/RGB/alpha)")
+        print(f"[HISTOGRAM] Raw raster value stats:")
+        print(f"  - Min: {float(valid_values.min()):.6f}")
+        print(f"  - Max: {float(valid_values.max()):.6f}")
+        print(f"  - Mean: {float(valid_values.mean()):.6f}")
+        print(f"  - Std: {float(valid_values.std()):.6f}")
+        print(f"  - Count: {valid_values.size}")
+        
+        # Sanity check: if min=0 and max=255, we're using image bytes (WRONG)
+        if valid_values.min() == 0 and valid_values.max() == 255:
+            print(f"[HISTOGRAM] ⚠️  WARNING: Values are 0-255 (image bytes) - this is WRONG!")
+            print(f"[HISTOGRAM] ⚠️  Expected: float values in 0-100 range matching Stats Summary")
+        elif valid_values.min() >= 0 and valid_values.max() <= 1.5:
+            print(f"[HISTOGRAM] ⚠️  Values appear to be in 0-1 range, may need scaling to 0-100")
+        elif valid_values.min() >= 0 and valid_values.max() <= 100:
+            print(f"[HISTOGRAM] ✓ Values are in expected 0-100 range")
+        else:
+            print(f"[HISTOGRAM] ⚠️  Values are outside 0-100 range: [{valid_values.min():.2f}, {valid_values.max():.2f}]")
+        
+        # Use values AS-IS (no clamping) - the colormap handles out-of-range values
+        # But for histogram, we only want to bin values that are in the valid 0-100 range
+        # Values outside this range should be excluded from histogram (they're edge cases)
+        values_for_hist = valid_values.copy()
+        
+        # Only include values in [0, 100] range for histogram
+        # Values outside this range are edge cases and shouldn't affect the histogram
+        valid_range_mask = (values_for_hist >= 0) & (values_for_hist <= 100)
+        values_in_range = values_for_hist[valid_range_mask]
+        
+        if values_in_range.size == 0:
+            print(f"[HISTOGRAM] ⚠️  WARNING: No values in [0, 100] range!")
+        else:
+            print(f"[HISTOGRAM] Values in [0, 100] range: {values_in_range.size} / {valid_values.size}")
+            if values_in_range.size < valid_values.size:
+                out_of_range = valid_values.size - values_in_range.size
+                print(f"[HISTOGRAM] Excluded {out_of_range} values outside [0, 100] range")
+        
+        # Bin assignment: same logic as classify_to_colormap
+        # np.digitize returns index of bin, where:
+        # - value in [0, 10) -> index 1 -> bin 0
+        # - value in [10, 20) -> index 2 -> bin 1
+        # - ...
+        # - value == 100 -> index 10 -> bin 9 (last bin)
+        if values_in_range.size > 0:
+            bin_indices = np.digitize(values_in_range, histogram_bins) - 1
+            # Clamp to valid range [0, 9] (shouldn't be needed, but safety check)
+            bin_indices = np.clip(bin_indices, 0, 9)
+            
+            # Count pixels in each bin using numpy bincount (efficient)
+            counts = np.bincount(bin_indices, minlength=10)
+            histogram_counts = counts.astype(int)
+            
+            # Compute percentages
+            total_for_percentages = histogram_counts.sum()
+            if total_for_percentages > 0:
+                histogram_percentages = (histogram_counts / total_for_percentages * 100).astype(float)
+            else:
+                histogram_percentages = np.zeros(10, dtype=float)
+        
+        total_valid_pixels = int(valid_values.size)
+    else:
+        total_valid_pixels = 0
+    
+    print(f"\n[HISTOGRAM] Final histogram stats:")
+    print(f"  - Total valid pixels: {total_valid_pixels}")
+    print(f"  - Pixels in [0, 100] range: {histogram_counts.sum()}")
+    print(f"  - Bin counts: {histogram_counts.tolist()}")
+    print(f"  - Bin percentages: {[f'{p:.2f}%' for p in histogram_percentages]}")
+    print(f"  - Sum of bins: {histogram_counts.sum()} (should equal pixels in [0, 100] range)")
+
     # Alpha channel: 255 for valid pixels, 0 for masked/invalid pixels
     # This ensures masked pixels (outside polygon) are fully transparent
     alpha = (mask_valid * 255).astype("uint8")
@@ -609,9 +698,17 @@ def clip_raster_for_layer(raster_layer_id: int, user_clip_geojson: dict):
             "east": float(east_4326),   # lon
             "north": float(north_4326), # lat
         },
-        # 👇 for charts
+        # 👇 for charts (legacy - kept for compatibility)
         "pixels": pixel_list,
         "values": pixel_list,   # alias so frontend can use either
+        # 👇 NEW: Histogram computed from REAL raster values (same as colormap)
+        "histogram": {
+            "bins": [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],  # Bin edges for reference
+            "counts": histogram_counts.tolist(),  # Count of pixels in each bin [0-10, 10-20, ..., 90-100]
+            "percentages": histogram_percentages.tolist(),  # Percentage of pixels in each bin
+            "total_valid_pixels": int(total_valid_pixels),  # Total pixels used (excludes nodata)
+            "pixels_in_range": int(histogram_counts.sum()),  # Pixels in [0, 100] range (used for histogram)
+        },
     }
 
 # -----------------------------------------

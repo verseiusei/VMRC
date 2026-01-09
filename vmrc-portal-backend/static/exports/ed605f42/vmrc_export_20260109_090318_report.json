@@ -1,0 +1,97 @@
+{
+  "export_date": "2026-01-09T09:03:19.253445",
+  "export_id": "ed605f42",
+  "software": "VMRC Portal",
+  "raster": {
+    "name": "HSL_25_DRY.tif",
+    "path": "D:\\VMRC_Project\\Data_Analysis!!\\Nov20\\HighStressMortality\\Western_Hemlock\\25\\HSL_25_DRY.tif"
+  },
+  "context": {
+    "mapType": "hsl",
+    "species": "Western Hemlock",
+    "coverPercent": "25",
+    "condition": "D",
+    "month": null,
+    "stressLevel": null,
+    "hslClass": null,
+    "selectedRasterName": "HSL_25_DRY.tif",
+    "selectedRasterPath": "D:\\VMRC_Project\\Data_Analysis!!\\Nov20\\HighStressMortality\\Western_Hemlock\\25\\HSL_25_DRY.tif"
+  },
+  "aoi": {
+    "bounds": {
+      "west": -122.90712858582755,
+      "south": 42.96973136652332,
+      "east": -116.79046191940554,
+      "north": 46.60306469971132
+    }
+  },
+  "statistics": {
+    "min": 0.1663656383752823,
+    "max": 100.0,
+    "mean": 23.131883672800097,
+    "std": 31.4046896744016,
+    "count": 307000,
+    "median": 7.86620306968689,
+    "percentiles": {
+      "p10": 2.3785409927368164,
+      "p25": 4.465157508850098,
+      "p50": 7.866180896759033,
+      "p75": 22.247007369995117,
+      "p90": 91.57806396484375
+    }
+  },
+  "histogram": {
+    "bins": [
+      {
+        "range": "0-10",
+        "count": 29415,
+        "percentage": 58.830000000000005
+      },
+      {
+        "range": "10-20",
+        "count": 7398,
+        "percentage": 14.796000000000001
+      },
+      {
+        "range": "20-30",
+        "count": 2234,
+        "percentage": 4.468
+      },
+      {
+        "range": "30-40",
+        "count": 1290,
+        "percentage": 2.58
+      },
+      {
+        "range": "40-50",
+        "count": 852,
+        "percentage": 1.704
+      },
+      {
+        "range": "50-60",
+        "count": 820,
+        "percentage": 1.6400000000000001
+      },
+      {
+        "range": "60-70",
+        "count": 728,
+        "percentage": 1.456
+      },
+      {
+        "range": "70-80",
+        "count": 797,
+        "percentage": 1.5939999999999999
+      },
+      {
+        "range": "80-90",
+        "count": 1213,
+        "percentage": 2.426
+      },
+      {
+        "range": "90-100",
+        "count": 5253,
+        "percentage": 10.506
+      }
+    ]
+  }
+}

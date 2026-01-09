@@ -1,0 +1,34 @@
+# VMRC Export Report
+# Export Date: 2026-01-09T08:53:59.947151
+# Export ID: 8f383fd5
+# Software: VMRC Portal
+# Raster: HSL2.5_DF_0_D_l.tif
+# Raster Path: D:\VMRC_Project\Data_Analysis!!\Nov20\Mortality-DEC30\HighStressMortality\Douglas_Fir\0\HSL2.5_DF_0_D_l.tif
+# Filter Selections:
+#   Map Type: hsl
+#   Species: Douglas-fir
+#   Condition: D
+#   Cover %: 0
+#   HSL Class: l
+
+Statistics Summary
+Metric,Value
+Count,47259
+Min,0.00
+Max,1.16
+Mean,0.33
+Std Dev,0.19
+Median,0.33
+
+Histogram Bins
+Range,Count,Percentage
+0-10,47259,100.00%
+10-20,0,0.00%
+20-30,0,0.00%
+30-40,0,0.00%
+40-50,0,0.00%
+50-60,0,0.00%
+60-70,0,0.00%
+70-80,0,0.00%
+80-90,0,0.00%
+90-100,0,0.00%

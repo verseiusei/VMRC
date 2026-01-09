@@ -35,9 +35,9 @@ import { sampleRasterValue } from "../../lib/rasterApi";
 import RasterOverlay from "./RasterOverlay";
 
 // ======================================================
-// UPLOADED AOI LAYER - Non-editable, protected from Geoman
+// AOI LAYER - Renders a single AOI (drawn or uploaded)
 // ======================================================
-function UploadedAOILayer({ data, index }) {
+function AoiLayer({ data, aoiId, aoiType, onRemove }) {
   const map = useMap();
   const layerRef = useRef(null);
 
@@ -85,6 +85,88 @@ function UploadedAOILayer({ data, index }) {
     return () => {
       map.off("pm:create", preventGeoman);
       map.off("pm:globaleditmodetoggled", preventGeoman);
+      // Note: react-leaflet automatically removes the layer when component unmounts
+    };
+  }, [map, data]);
+
+  // Style based on type
+  const style = aoiType === "upload"
+    ? {
+        color: "#f97316", // orange outline for uploaded
+        weight: 2,
+        fillOpacity: 0.15,
+      }
+    : {
+        color: "#2563eb", // blue outline for drawn
+        weight: 3,
+        fillColor: "#2563eb",
+        fillOpacity: 0.1,
+        dashArray: "5, 5", // dashed line
+      };
+
+  return (
+    <GeoJSON
+      ref={layerRef}
+      data={data}
+      style={style}
+      eventHandlers={{
+        // Handle removal via Geoman erase tool
+        remove: () => {
+          if (onRemove && aoiId) {
+            onRemove(aoiId);
+          }
+        },
+      }}
+    />
+  );
+}
+
+// ======================================================
+// UPLOADED AOI LAYER - Legacy component (kept for compatibility)
+// ======================================================
+function UploadedAOILayer({ data, index }) {
+  const map = useMap();
+  const layerRef = useRef(null);
+
+  useEffect(() => {
+    if (!map || !layerRef.current) return;
+
+    const layer = layerRef.current.leafletElement;
+    if (!layer) return;
+
+    layer._pmIgnore = true;
+
+    if (layer.pm) {
+      layer.pm.disable();
+      const originalEnable = layer.pm.enable;
+      layer.pm.enable = function() {
+        console.warn("Attempted to enable Geoman on uploaded AOI - ignored");
+        return this;
+      };
+    }
+
+    if (layer.eachLayer) {
+      layer.eachLayer((sublayer) => {
+        sublayer._pmIgnore = true;
+        if (sublayer.pm) {
+          sublayer.pm.disable();
+        }
+      });
+    }
+
+    const preventGeoman = () => {
+      if (layer.pm) {
+        layer.pm.disable();
+      }
+    };
+
+    map.on("pm:create", preventGeoman);
+    map.on("pm:globaleditmodetoggled", preventGeoman);
+
+    return () => {
+      map.off("pm:create", preventGeoman);
+      map.off("pm:globaleditmodetoggled", preventGeoman);
+      // Note: react-leaflet automatically removes the layer when component unmounts
     };
   }, [map, data]);
 
@@ -104,7 +186,7 @@ function UploadedAOILayer({ data, index }) {
 // ======================================================
 // CUSTOM DRAWING TOOLBOX (user clip only, AOI stays)
 // ======================================================
-function MapTools({ onUserClipChange }) {
+function MapTools({ onUserClipChange, onRemoveAoi, aois = [] }) {
   const map = useMap();
   const lastDrawnLayerRef = useRef(null); // track ONLY the user clip layer
 
@@ -144,9 +226,9 @@ function MapTools({ onUserClipChange }) {
       if (map.pm && map.pm.Toolbar) {
         try {
           // Remove unwanted controls
-          map.pm.Toolbar.removeControl("Text");
-          map.pm.Toolbar.removeControl("RotateMode");
-          map.pm.Toolbar.removeControl("Cut");
+        map.pm.Toolbar.removeControl("Text");
+        map.pm.Toolbar.removeControl("RotateMode");
+        map.pm.Toolbar.removeControl("Cut");
           // Remove edit controls if they exist
           map.pm.Toolbar.removeControl("EditMode");
           map.pm.Toolbar.removeControl("editMode");
@@ -191,20 +273,32 @@ function MapTools({ onUserClipChange }) {
       console.log("🔥 PM CREATE FIRED — POLYGON CAPTURED");
       const newLayer = e.layer;
 
-      // Only remove the previous user-drawn clip,
-      // NEVER touch the AOI GeoJSON layer.
-      if (lastDrawnLayerRef.current && map.hasLayer(lastDrawnLayerRef.current)) {
-        map.removeLayer(lastDrawnLayerRef.current);
-      }
-
+      // DO NOT remove previous layers - allow multiple polygons
+      // Store reference for potential future use, but don't remove
       lastDrawnLayerRef.current = newLayer;
       onUserClipChange(newLayer.toGeoJSON());
     });
 
-    // When a layer is removed via the Geoman UI, clear clip
+    // When a layer is removed via the Geoman UI (erase tool)
     map.on("pm:remove", (e) => {
-      console.log("🔥 PM REMOVE FIRED — CLIP CLEARED");
-      if (e.layer === lastDrawnLayerRef.current) {
+      console.log("🔥 PM REMOVE FIRED — LAYER REMOVED");
+      const removedLayer = e.layer;
+      
+      // Find which AOI this layer belongs to by comparing GeoJSON
+      const removedGeoJSON = removedLayer.toGeoJSON();
+      const matchingAoi = aois.find(aoi => {
+        try {
+          return JSON.stringify(aoi.geojson) === JSON.stringify(removedGeoJSON);
+        } catch (err) {
+          return false;
+        }
+      });
+      
+      if (matchingAoi && onRemoveAoi) {
+        // Remove the AOI and its overlay
+        onRemoveAoi(matchingAoi.id);
+      } else if (removedLayer === lastDrawnLayerRef.current) {
+        // Fallback: if it was the last drawn layer, clear it
         lastDrawnLayerRef.current = null;
         onUserClipChange(null);
       }
@@ -479,11 +573,14 @@ function ClickSampler({ activeRasterId, overlayBounds, onSample }) {
 export default function BaseMap({
   globalAoi,
   uploadedAois = [],
-  userClip,
-  overlayUrl,
-  overlayBounds,
+  aois = [], // Unified AOI array with overlays
+  userClip, // Legacy - keep for compatibility
+  overlayUrl = null, // Optional - legacy single overlay
+  overlayBounds = null, // Optional - legacy single overlay
   onUserClipChange,
+  onRemoveAoi = null, // Optional callback to remove AOI by ID
   activeRasterId,
+  datasetPreview = null, // GeoPDF dataset preview: { id, preview_url, preview_bounds }
   onMapReady,
 })
  {
@@ -529,37 +626,56 @@ export default function BaseMap({
           />
         )}
 
-        {/* Uploaded AOIs - Non-editable, protected from Geoman */}
-        {uploadedAois.map((aoi, i) => (
-          <UploadedAOILayer
-            key={`uploaded-${i}`}
-            data={aoi}
-            index={i}
-          />
-        ))}
+        {/* All AOIs (both drawn and uploaded) with their overlays */}
+        {aois && Array.isArray(aois) && aois.map((aoi) => {
+          if (!aoi || !aoi.id || !aoi.geojson) return null;
+          
+          return (
+            <React.Fragment key={aoi.id}>
+              {/* AOI Geometry */}
+              <AoiLayer
+                data={aoi.geojson}
+                aoiId={aoi.id}
+                aoiType={aoi.type || "draw"}
+                onRemove={onRemoveAoi}
+              />
+              
+              {/* Raster Overlay for this AOI */}
+              {aoi.overlayUrl && aoi.overlayBounds && (
+                <RasterOverlay
+                  overlayUrl={aoi.overlayUrl}
+                  bounds={aoi.overlayBounds}
+                />
+              )}
+            </React.Fragment>
+          );
+        })}
 
-        {/* User Clip - Shows the active clip region (from upload or draw) */}
-        {userClip && (
-          <GeoJSON
-            data={userClip}
-            style={{
-              color: "#2563eb", // Blue outline
-              weight: 3,
-              fillColor: "#2563eb",
-              fillOpacity: 0.1,
-              dashArray: "5, 5", // Dashed line to distinguish from other AOIs
-            }}
+        {/* Legacy: Single overlay support (for backward compatibility) */}
+        {/* Also show if aois exist but none have overlays (e.g., when showing raster from list whose AOI was removed) */}
+        {overlayUrl && overlayBounds && (
+          (aois.length === 0 || !aois.some(aoi => aoi.overlayUrl && aoi.overlayBounds)) && (
+            <RasterOverlay
+              overlayUrl={overlayUrl}
+              bounds={overlayBounds}
+            />
+          )
+        )}
+
+        {/* GeoPDF Dataset Preview Overlay */}
+        {datasetPreview && datasetPreview.preview_url && datasetPreview.preview_bounds && (
+          <RasterOverlay
+            overlayUrl={datasetPreview.preview_url}
+            bounds={datasetPreview.preview_bounds}
           />
         )}
 
-        {/* Raster overlay from backend-clipped PNG */}
-        <RasterOverlay 
-          overlayUrl={overlayUrl} 
-          bounds={overlayBounds}
-        />
-
         {/* Drawing tools + legend */}
-        <MapTools onUserClipChange={onUserClipChange} />
+        <MapTools 
+          onUserClipChange={onUserClipChange}
+          onRemoveAoi={onRemoveAoi}
+          aois={aois}
+        />
         <LegendControl />
 
         {/* Raster quality control - persistent Leaflet control */}

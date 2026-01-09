@@ -21,12 +21,12 @@ def create_application() -> FastAPI:
     ]
 
     app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    CORSMiddleware,
+    allow_origins=["*"],          # ✅ demo: allow all origins
+    allow_credentials=False,      # must be False when allow_origins is "*"
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
     # ---------- STATIC FILES ----------
     # This serves your PNG overlays located in /static/overlays/*

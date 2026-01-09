@@ -10,5 +10,6 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    allowedHosts: true, // ✅ allow Cloudflare tunnel host for 1-day demo
   },
 });
