@@ -633,6 +633,7 @@ export default function LayerGroupManager({
 
     // Cleanup pair registry
     pairsRef.current.delete(aoiId);
+    pairByAoiId.current.delete(aoiId); // Also clean up split registry pair mapping
 
     // Cleanup tracking refs
     if (uploadedLayersRef.current.has(aoiId)) {
@@ -641,7 +642,8 @@ export default function LayerGroupManager({
     if (drawnLayerRef.current === aoiLayer) {
       drawnLayerRef.current = null;
     }
-    aoiLayersRef.current.delete(aoiId); // Remove from unified registry
+    aoiLayersRef.current.delete(aoiId); // Remove from legacy unified registry
+    aoiLayersById.current.delete(aoiId); // CRITICAL: Remove from split registry to prevent re-registration
 
     // Remove raster from React state (createdRasters array)
     if (onRemoveRasterByAoiId && aoiId) {

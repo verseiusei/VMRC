@@ -1119,18 +1119,27 @@ export default function MapExplorer() {
     // FALLBACK: Check uploadedAois array (legacy, but keep for compatibility)
     const hasUploads = (uploadedAois?.length ?? 0) > 0;
     
-    // If persistent refs have data but React state is empty, restore from refs
-    if (persistentDrawnGeo && !userClip && !userClipRef.current) {
-      console.log("[Generate] 🔄 RESTORING: React state lost, restoring from persistent refs");
+    // CRITICAL: Do NOT restore from refs if aois array is empty
+    // If aois array is empty, it means either:
+    // 1. No AOIs have been created yet, OR
+    // 2. All AOIs were explicitly erased
+    // Restoring from refs would bring back erased AOIs (ghost AOIs)
+    // Only restore if we're sure the state was lost due to a remount, not erasure
+    // For now, we skip restoration to prevent ghost AOIs
+    // If persistent refs have data but React state is empty, DO NOT restore automatically
+    // The user should re-draw or re-upload if they want to regenerate
+    if (persistentDrawnGeo && !userClip && !userClipRef.current && aois.length > 0) {
+      // Only restore if there are other AOIs in state (means state wasn't cleared by erasure)
+      console.log("[Generate] 🔄 RESTORING: React state lost, restoring from persistent refs (other AOIs exist)");
       setUserClip(persistentDrawnGeo);
       userClipRef.current = persistentDrawnGeo;
       drawnAoiIdRef.current = persistentDrawnAoiIdRef.current;
     }
     
-    // If persistent aois have data but React state is empty, restore from refs
+    // Only restore aois array if it's not empty (means state wasn't cleared by erasure)
     if (persistentAois.length > 0 && aois.length === 0) {
-      console.log("[Generate] 🔄 RESTORING: aois array lost, restoring from persistent refs");
-      setAois(persistentAois);
+      // DO NOT restore - if aois is empty, all AOIs were likely erased
+      console.warn("[Generate] ⚠️ Skipping restore: aois array is empty (likely all AOIs were erased)");
     }
     
     // INSTRUMENTATION: Log detection decision
@@ -1142,31 +1151,31 @@ export default function MapExplorer() {
       decision: hasAoisInState || hasDrawn || hasUploads ? "HAS_AOI" : "NO_AOI",
     });
     
-    // Get targets from aois array (primary source of truth)
+    // CRITICAL: Get targets ONLY from aois array (primary source of truth)
+    // Do NOT use refs as fallback - if AOI was erased, it should NOT be in aois array
+    // Using refs as fallback causes "ghost" AOIs to regenerate after erasure
     let targets = aoisInState;
     
-    // If hasDrawn, ensure drawn AOI is in targets
-    // Check if drawn AOI is already in targets by checking aois array first
+    // Check if drawn AOI is in aois array (if it was erased, it won't be here)
     const drawnInAois = aois.find(a => a.type === "draw");
     const drawnInTargets = targets.some(t => t.type === "draw");
     
-    if (hasDrawn && drawnGeo) {
-      if (drawnInAois && !drawnInTargets) {
-        // Drawn AOI exists in aois array but not in targets - add it
-        console.log("[Generate] ✅ Adding drawn AOI from aois array to targets");
-        targets.push(drawnInAois);
-      } else if (!drawnInAois && !drawnInTargets) {
-        // Drawn AOI not in aois array but we have GeoJSON - create temporary target
-        // Use stable aoiId from ref if available
-        const stableAoiId = drawnAoiIdRef.current || "drawn";
-        console.log("[Generate] ✅ Adding drawn AOI from ref/state to targets (not in aois array)");
-        targets.push({
-          id: stableAoiId,
-          type: "draw",
-          name: "Drawn AOI",
-          geojson: drawnGeo,
-        });
-      }
+    // Only add drawn AOI if it exists in aois array (not from refs)
+    if (drawnInAois && !drawnInTargets) {
+      // Drawn AOI exists in aois array but not in targets - add it
+      console.log("[Generate] ✅ Adding drawn AOI from aois array to targets");
+      targets.push(drawnInAois);
+    } else if (!drawnInAois && hasDrawn && drawnGeo) {
+      // Drawn AOI not in aois array but refs have data
+      // This means the AOI was likely erased but refs weren't cleared properly
+      // DO NOT add it - only use AOIs from the aois array
+      console.warn("[Generate] ⚠️ WARNING: Drawn AOI found in refs but NOT in aois array - skipping (likely erased)");
+      console.warn("[Generate] This AOI should have been removed from state. Ref data:", {
+        persistentDrawnGeo: !!persistentDrawnGeo,
+        userClipRef: !!userClipRef.current,
+        userClip: !!userClip,
+        drawnAoiIdRef: drawnAoiIdRef.current,
+      });
     }
     
     // If still no targets found, show error
@@ -1770,30 +1779,74 @@ export default function MapExplorer() {
       }
 
       // Check for overlaps and collect valid AOIs
+      // Split FeatureCollections with multiple features into separate AOIs (one per feature)
       const newAois = [];
+      const baseFileName = file.name.replace(/\.[^/.]+$/, ""); // Remove extension for naming
+      let featureIndex = 0;
+      
       for (const geo of validCollections) {
-        const overlapCheck = checkAoiOverlap(geo, selectedAois);
-        if (overlapCheck.overlaps) {
-          errors.push(`${file.name}: ${overlapCheck.message || "Overlaps with existing AOI. Choose something else."}`);
-          continue;
-        }
-
-        const aoiId = `upload-${file.name}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
         const featureCollection = ensureFeatureCollection(geo);
-
-        newAois.push({
-          id: aoiId,
-          geojson: featureCollection,
-          name: file.name + (validCollections.length > 1 ? ` (Layer ${validCollections.indexOf(geo) + 1})` : ""),
-          type: "upload",
-          overlayUrl: null,
-          overlayBounds: null,
-          stats: null,
-          pixelValues: [],
-          activeRasterId: null,
-          visible: true,
-          _fileName: file.name,
-        });
+        
+        // If FeatureCollection has multiple features, split them into separate AOIs
+        if (featureCollection.features && featureCollection.features.length > 1) {
+          for (let i = 0; i < featureCollection.features.length; i++) {
+            const feature = featureCollection.features[i];
+            
+            // Create a FeatureCollection with just this one feature
+            const singleFeatureCollection = {
+              type: "FeatureCollection",
+              features: [feature],
+            };
+            
+            // Check for overlaps with existing AOIs
+            const overlapCheck = checkAoiOverlap(singleFeatureCollection, selectedAois);
+            if (overlapCheck.overlaps) {
+              errors.push(`${file.name} #${i + 1}: ${overlapCheck.message || "Overlaps with existing AOI. Choose something else."}`);
+              continue;
+            }
+            
+            featureIndex++;
+            const aoiId = `upload-${baseFileName}-${featureIndex}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+            
+            newAois.push({
+              id: aoiId,
+              geojson: singleFeatureCollection,
+              name: `${baseFileName} #${featureIndex}`,
+              type: "upload",
+              overlayUrl: null,
+              overlayBounds: null,
+              stats: null,
+              pixelValues: [],
+              activeRasterId: null,
+              visible: true,
+              _fileName: file.name,
+            });
+          }
+        } else {
+          // Single feature or single FeatureCollection - create one AOI
+          const overlapCheck = checkAoiOverlap(featureCollection, selectedAois);
+          if (overlapCheck.overlaps) {
+            errors.push(`${file.name}: ${overlapCheck.message || "Overlaps with existing AOI. Choose something else."}`);
+            continue;
+          }
+          
+          featureIndex++;
+          const aoiId = `upload-${baseFileName}-${featureIndex}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+          
+          newAois.push({
+            id: aoiId,
+            geojson: featureCollection,
+            name: featureIndex === 1 && validCollections.length === 1 ? baseFileName : `${baseFileName} #${featureIndex}`,
+            type: "upload",
+            overlayUrl: null,
+            overlayBounds: null,
+            stats: null,
+            pixelValues: [],
+            activeRasterId: null,
+            visible: true,
+            _fileName: file.name,
+          });
+        }
       }
 
       if (newAois.length === 0) {
@@ -2005,7 +2058,7 @@ export default function MapExplorer() {
   }, []);
 
   // Handle when AOI is erased (called from BaseMap when user erases drawn AOI)
-  // This removes created rasters with matching aoiId from state
+  // This removes created rasters with matching aoiId from state AND removes AOI from state
   const handleAoiErased = useCallback((aoiId) => {
     // CRITICAL GUARD: Do NOT clear overlays if export is active
     if (isExportingRef.current) {
@@ -2016,14 +2069,18 @@ export default function MapExplorer() {
     
     console.log("[MapExplorer] handleAoiErased called with aoiId:", aoiId);
     
-    // Remove all created rasters with matching aoiId
+    // CRITICAL: Call handleRemoveAoi FIRST to ensure LayerGroupManager cleanup
+    // This removes AOI from state, clears refs, and triggers LayerGroupManager.deletePairByAoiId
+    handleRemoveAoi(aoiId);
+    
+    // Remove all created rasters with matching aoiId (overlays)
     setCreatedRasters((prev) => {
       const filtered = prev.filter((r) => r.aoiId !== aoiId);
       console.log(`[MapExplorer] Removed ${prev.length - filtered.length} raster(s) for erased AOI ${aoiId}`);
       return filtered;
     });
     
-    // Clear drawn AOI refs if this was the drawn AOI
+    // Clear drawn AOI refs if this was the drawn AOI (handleRemoveAoi does this, but ensure it's done)
     const isDrawnAoi = drawnAoiIdRef.current === aoiId || persistentDrawnAoiIdRef.current === aoiId;
     if (isDrawnAoi) {
       console.log("[MapExplorer] 🗑️ EXPLICIT ERASE: Clearing drawn AOI refs for erased AOI");
@@ -2037,7 +2094,7 @@ export default function MapExplorer() {
       persistentDrawnAoiRef.current = null;
       persistentDrawnAoiIdRef.current = null;
       
-      // Also remove from aois array using the stable aoiId
+      // Also remove from aois array using the stable aoiId (handleRemoveAoi does this, but ensure it's done)
       setAois((prev) => {
         const filtered = prev.filter((a) => a.id !== aoiId);
         persistentAoisRef.current = filtered; // Update persistent ref too
@@ -2075,6 +2132,10 @@ export default function MapExplorer() {
           drawnAoiIdRef.current = null;
           userClipRef.current = null;
           setUserClip(null);
+          
+          // CRITICAL: Also clear persistent refs to prevent ghost AOIs
+          persistentDrawnAoiRef.current = null;
+          persistentDrawnAoiIdRef.current = null;
         }
         
         // Remove from uploadedAois if it was uploaded
@@ -2152,42 +2213,19 @@ export default function MapExplorer() {
     }
 
     // Remove from list (this removes it from map automatically via LayerGroupManager)
-    // CRITICAL: This removes the raster from React state so it cannot reappear
-    console.log(`[MapExplorer] handleRemoveRaster: Removing raster ${rasterId} from createdRasters state`);
+    // CRITICAL: This removes ONLY the raster overlay, NOT the AOI
+    // The AOI should remain visible - only the overlay is removed
+    console.log(`[MapExplorer] handleRemoveRaster: Removing raster ${rasterId} (aoiId: ${aoiId}) from createdRasters state - AOI preserved`);
     setCreatedRasters((prev) => {
       const filtered = prev.filter((r) => r.id !== rasterId);
       console.log(`[MapExplorer] handleRemoveRaster: State updated - ${prev.length} -> ${filtered.length} rasters`);
       return filtered;
     });
 
-    // Also remove the linked AOI if it exists (but not base AOI)
-    // Note: LayerGroupManager will handle the actual layer removal, but we need to update state
-    if (aoiId) {
-      // Check if this AOI is in uploadedAois
-      const uploadedAoi = uploadedAois.find((a) => a.id === aoiId);
-      if (uploadedAoi) {
-        // Remove from uploadedAois
-        setUploadedAois((prev) => prev.filter((a) => a.id !== aoiId));
-        // Also remove from aois array
-        setAois((prev) => prev.filter((a) => a.id !== aoiId));
-        // Remove from selectedAois
-        setSelectedAois((prev) => prev.filter((a) => a.id !== aoiId));
-        console.log(`[MapExplorer] Removed uploaded AOI ${aoiId} linked to raster ${rasterId}`);
-      } else {
-        // Check if this AOI is the drawn AOI (find from aois array)
-        // Use current aois state to check if it's a drawn AOI
-        const drawnAoiInState = aois.find((a) => a.id === aoiId && a.type === "draw");
-        if (drawnAoiInState) {
-          // Clear userClip when drawn AOI is removed
-          setUserClip(null);
-          console.log(`[MapExplorer] Removed drawn AOI ${aoiId} linked to raster ${rasterId}`);
-        }
-        // Remove from aois array (using functional update)
-        setAois((prev) => prev.filter((a) => a.id !== aoiId));
-        // Remove from selectedAois (using functional update)
-        setSelectedAois((prev) => prev.filter((a) => a.id !== aoiId));
-      }
-    }
+    // CRITICAL: Do NOT remove the AOI from state here
+    // The "Remove" button in CreatedRastersList should only remove the raster overlay
+    // The AOI should remain visible on the map
+    // AOI removal should only happen via eraser tool or explicit "Remove AOI" action
 
     // If it was active, switch to another raster or clear
     if (wasActive) {

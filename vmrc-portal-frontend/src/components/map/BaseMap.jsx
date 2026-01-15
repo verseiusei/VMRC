@@ -515,7 +515,14 @@ function MapTools({ onUserClipChange, onRemoveAoi, aois = [], onDrawStart = null
           lastDrawnAoiRef.current = null; // Clear persistent GeoJSON ref
         }
         
-        // Notify parent that AOI was erased (so it can clean up rasters)
+        // CRITICAL: Call onRemoveAoi FIRST to trigger LayerGroupManager.deletePairByAoiId
+        // This ensures the AOI is removed from LayerGroupManager's registry
+        if (aoiId && onRemoveAoi) {
+          console.log("[MapTools] Calling onRemoveAoi with aoiId:", aoiId, "(triggers LayerGroupManager cleanup)");
+          onRemoveAoi(aoiId);
+        }
+        
+        // Notify parent that AOI was erased (so it can clean up rasters and state)
         if (aoiId && onAoiErased) {
           console.log("[MapTools] Calling onAoiErased with aoiId:", aoiId);
           onAoiErased(aoiId);
