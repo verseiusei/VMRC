@@ -5,6 +5,7 @@ GeoPDF import/export endpoints for raster export and GeoPDF preview import.
 
 import subprocess
 import shutil
+import os
 from pathlib import Path
 from typing import Optional, Dict, Any
 from datetime import datetime
@@ -34,6 +35,63 @@ router = APIRouter(tags=["geopdf"])
 cleanup_old_uploads()
 
 
+@router.get("/geopdf/status")
+async def get_geopdf_status():
+    """
+    Diagnostic endpoint to check GDAL availability from the server's perspective.
+    """
+    import subprocess
+    import sys
+    
+    diagnostics = {
+        "gdal_cli_available": False,
+        "gdal_python_available": False,
+        "gdal_fully_available": False,
+        "python_path": sys.executable,
+        "python_version": sys.version,
+        "gdal_cli_version": None,
+        "gdal_python_version": None,
+        "gdal_cli_error": None,
+        "gdal_python_error": None,
+        "path_env": os.environ.get("PATH", "")[:200] + "..." if len(os.environ.get("PATH", "")) > 200 else os.environ.get("PATH", ""),
+    }
+    
+    # Check GDAL CLI
+    try:
+        result = subprocess.run(
+            ["gdalwarp", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            diagnostics["gdal_cli_available"] = True
+            diagnostics["gdal_cli_version"] = result.stdout.strip()
+        else:
+            diagnostics["gdal_cli_error"] = result.stderr or "Command failed"
+    except FileNotFoundError:
+        diagnostics["gdal_cli_error"] = "gdalwarp command not found in PATH"
+    except Exception as e:
+        diagnostics["gdal_cli_error"] = str(e)
+    
+    # Check GDAL Python
+    try:
+        from osgeo import gdal
+        diagnostics["gdal_python_available"] = True
+        diagnostics["gdal_python_version"] = gdal.__version__
+    except ImportError as e:
+        diagnostics["gdal_python_error"] = str(e)
+    except Exception as e:
+        diagnostics["gdal_python_error"] = str(e)
+    
+    diagnostics["gdal_fully_available"] = (
+        diagnostics["gdal_cli_available"] and 
+        diagnostics["gdal_python_available"]
+    )
+    
+    return diagnostics
+
+
 class GeoPDFExportRequest(BaseModel):
     raster_id: int
     aoi_geojson: dict
@@ -61,16 +119,16 @@ async def export_geopdf_endpoint(req: GeoPDFExportRequest):
     if not HAS_GDAL:
         if not HAS_GDAL_CLI:
             raise HTTPException(
-                status_code=503,
+                status_code=500,
                 detail="GDAL command-line tools are not available. GeoPDF export requires GDAL to be installed. "
                        "See installation instructions: https://gdal.org/download.html"
             )
         else:
             raise HTTPException(
-                status_code=503,
+                status_code=500,
                 detail="GDAL Python bindings are not available. Install with: "
                        "OSGeo4W: Install 'gdal-python' package, or "
-                       "Conda: conda install -c conda-forge python-gdal, or "
+                       "Conda: conda install -c conda-forge gdal, or "
                        "Pip: pip install gdal (must match system GDAL version)"
             )
     
@@ -119,7 +177,7 @@ async def export_geopdf_endpoint(req: GeoPDFExportRequest):
         raise HTTPException(status_code=500, detail=f"GeoPDF export failed: {str(e)}")
 
 
-@router.post("/import/geopdf")
+@router.post("/upload/geopdf")
 async def import_geopdf_endpoint(file: UploadFile = File(...)):
     """
     Import a GeoPDF and convert to PNG overlay for map preview.
@@ -147,7 +205,7 @@ async def import_geopdf_endpoint(file: UploadFile = File(...)):
                 status_code=503,
                 detail="GDAL Python bindings are not available. Install with: "
                        "OSGeo4W: Install 'gdal-python' package, or "
-                       "Conda: conda install -c conda-forge python-gdal, or "
+                       "Conda: conda install -c conda-forge gdal, or "
                        "Pip: pip install gdal (must match system GDAL version)"
             )
     
@@ -190,6 +248,34 @@ async def import_geopdf_endpoint(file: UploadFile = File(...)):
             out_dir=layer_dir,
             layer_id=layer_id
         )
+        
+        # Save metadata for the imported layer
+        from app.services.layer_metadata import save_metadata
+        from datetime import datetime
+        
+        # Create metadata manually for GeoPDF (PNG doesn't have geographic stats)
+        metadata = {
+            "layer_id": layer_id,
+            "title": file.filename or "Uploaded GeoPDF",
+            "summary": f"User-uploaded GeoPDF preview: {file.filename or 'Unknown'}",
+            "tags": ["geopdf", "upload"],
+            "credits": "",
+            "units": "",
+            "crs": result.get("crs", "EPSG:4326"),
+            "bounds": result.get("bounds"),  # [[south, west], [north, east]]
+            "pixel_size": None,  # PNG overlays don't have meaningful pixel size
+            "stats": {
+                "min": None,
+                "max": None,
+                "mean": None,
+                "std": None,
+                "nodata": None,
+                "count": None
+            },
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "source_type": "geopdf_upload"
+        }
+        save_metadata(layer_id, metadata)
         
         print(f"[GEOPDF] ✓ Import complete: layer_id={layer_id}")
         return JSONResponse({

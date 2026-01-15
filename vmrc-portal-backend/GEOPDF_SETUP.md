@@ -92,7 +92,7 @@ Response:
 - Filename: `vmrc_<raster_id>_<timestamp>.pdf`
 
 #### 2. Import GeoPDF
-**POST** `/api/v1/import/geopdf`
+**POST** `/api/v1/upload/geopdf`
 
 Request (multipart/form-data):
 - `file`: GeoPDF file (max 200MB)
@@ -153,7 +153,7 @@ curl -X POST http://localhost:8000/api/v1/export/geopdf \
 ### Test Import with cURL
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/import/geopdf \
+curl -X POST http://localhost:8000/api/v1/upload/geopdf \
   -F "file=@/path/to/your/geopdf.pdf" \
   -H "Accept: application/json"
 ```

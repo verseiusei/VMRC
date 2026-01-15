@@ -23,7 +23,7 @@ This implementation adds GeoPDF export and import functionality to the VMRC Port
    - FastAPI router for GeoPDF endpoints
    - Endpoints:
      - `POST /api/v1/export/geopdf`: Export raster to GeoPDF
-     - `POST /api/v1/import/geopdf`: Import GeoPDF and get overlay info
+     - `POST /api/v1/upload/geopdf`: Import GeoPDF and get overlay info
      - `GET /api/v1/layers/<layer_id>/overlay.png`: Serve PNG overlay
    - Validates file types, sizes, and handles errors
    - Returns file downloads and JSON responses
@@ -36,7 +36,7 @@ This implementation adds GeoPDF export and import functionality to the VMRC Port
 
 #### 4. **MODIFIED: `vmrc-portal-frontend/src/lib/rasterApi.js`**
    - Added `exportGeoPDFNew()`: New function for GeoPDF export using `/api/v1/export/geopdf`
-   - Added `importGeoPDF()`: New function for GeoPDF import using `/api/v1/import/geopdf`
+   - Added `importGeoPDF()`: New function for GeoPDF import using `/api/v1/upload/geopdf`
    - Updated `exportGeoPDF()`: Legacy wrapper that calls `exportGeoPDFNew()`
    - Updated `uploadGeoPDF()`: Legacy wrapper that calls `importGeoPDF()`
    - Handles file downloads and blob responses
@@ -77,7 +77,7 @@ Response: PDF file download
 
 ### Import GeoPDF
 ```
-POST /api/v1/import/geopdf
+POST /api/v1/upload/geopdf
 Content-Type: multipart/form-data
 
 file: <GeoPDF file>

@@ -11,6 +11,9 @@ from datetime import datetime
 import uuid
 import json
 import re
+import sys
+print("PYTHON:", sys.executable)
+
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
@@ -20,10 +23,9 @@ from app.services.raster_service import clip_raster_for_layer, resolve_raster_pa
 from app.api.v1.routes_raster_export import normalize_for_export, sanitize_filename
 import rasterio
 from rasterio.mask import mask
+from rasterio.warp import transform_geom
 from shapely.geometry import shape, mapping
 from shapely.validation import make_valid
-from shapely.ops import transform as shapely_transform
-from pyproj import Transformer
 
 router = APIRouter(tags=["geopdf"])
 
@@ -52,6 +54,7 @@ def check_gdal_available() -> bool:
         return result.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
+        
 
 
 # Check GDAL on module load
@@ -90,7 +93,7 @@ def save_datasets_index(datasets: list) -> None:
             json.dump(datasets, f, indent=2)
     except Exception as e:
         print(f"Warning: Failed to save datasets index: {e}")
-
+    
 
 def extract_geopdf_bounds(pdf_path: Path) -> Optional[Dict[str, float]]:
     """
@@ -292,24 +295,53 @@ async def export_geopdf(req: GeoPDFExportRequest):
         with rasterio.open(raster_path) as src:
             raster_crs = src.crs
             
-            # Reproject geometry to raster CRS
-            if raster_crs and raster_crs.to_string() != "EPSG:4326":
-                transformer = Transformer.from_crs(
-                    "EPSG:4326",
-                    raster_crs,
-                    always_xy=True
-                )
-                geom_for_mask = shapely_transform(transformer.transform, user_geom_4326)
-            else:
-                geom_for_mask = user_geom_4326
+            # Reproject geometry to raster CRS using rasterio.warp.transform_geom (more precise)
+            # Input is EPSG:4326 (GeoJSON), output should be in raster CRS
+            print(f"[GEOPDF] Reprojecting geometry from EPSG:4326 to {raster_crs}")
+            aoi_geom_src = mapping(user_geom_4326)  # Convert shapely to GeoJSON dict
+            aoi_geom_raster_crs = transform_geom(
+                "EPSG:4326",
+                raster_crs.to_string() if hasattr(raster_crs, 'to_string') else str(raster_crs),
+                aoi_geom_src,
+                precision=6  # 6 decimal places for precision
+            )
+            shapes = [aoi_geom_raster_crs]  # Use GeoJSON dict directly
             
-            # Clip raster
-            geom_dict = mapping(geom_for_mask)
+            # Determine nodata value: use source nodata if available, otherwise choose based on dtype
+            nodata_value = src.nodata
+            if nodata_value is None:
+                # Choose a safe nodata value based on dtype
+                if np.issubdtype(src.dtypes[0], np.integer):
+                    # For integer types, use a value outside typical range
+                    if src.dtypes[0] == np.uint8:
+                        nodata_value = 255
+                    elif src.dtypes[0] == np.uint16:
+                        nodata_value = 65535
+                    else:
+                        nodata_value = -9999
+                else:
+                    # For float types
+                    nodata_value = -9999  # Use a sentinel value
+                print(f"[GEOPDF] Source has no nodata, using {nodata_value} as nodata value")
+            
+            # ============================================================
+            # MASK RASTER: Use all_touched=True to include any touched pixel
+            # ============================================================
+            # all_touched=True ensures every pixel that is even slightly touched
+            # by the AOI boundary is included. This guarantees no edge pixels are lost.
+            #
+            # Why this works:
+            # - By default, mask() only includes pixels whose center falls inside the polygon
+            # - all_touched=True includes ANY pixel touched or intersected by the boundary
+            # - Combined with proper CRS reprojection, this ensures complete pixel coverage
+            # ============================================================
             clipped, out_transform = mask(
                 src,
-                [geom_dict],
-                crop=True,
-                filled=False
+                shapes,  # GeoJSON geometry dict in raster CRS
+                crop=True,  # Crop to geometry bounds (no pre-windowing needed)
+                all_touched=True,  # CRITICAL: Include any pixel touched by boundary
+                filled=True,  # Fill masked areas with nodata
+                nodata=nodata_value  # Use source nodata or safe default
             )
             
             # Save clipped GeoTIFF
@@ -323,8 +355,8 @@ async def export_geopdf(req: GeoPDFExportRequest):
                 "compress": "lzw",
             })
             
-            if src.nodata is not None:
-                meta["nodata"] = src.nodata
+            # Use the nodata value we set in mask() call
+            meta["nodata"] = nodata_value
             
             with rasterio.open(temp_geotiff, "w", **meta) as dst:
                 dst.write(clipped)

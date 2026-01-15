@@ -69,7 +69,6 @@ elif not HAS_GDAL_PYTHON:
     print("ERROR:   - OSGeo4W: Install 'gdal-python' package in OSGeo4W setup")
     print("ERROR:   - Conda: conda install -c conda-forge gdal")
     print("ERROR:   - Pip: pip install gdal (may need to match system GDAL version)")
-    print("ERROR:   - Or use: conda install -c conda-forge gdal python-gdal")
 
 
 def export_geopdf(

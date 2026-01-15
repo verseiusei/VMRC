@@ -1,0 +1,174 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "bbox": [
+          -119.72576474467019,
+          42.01575512283307,
+          -114.02159816613681,
+          47.06554761335286
+        ],
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -119.33067095568084,
+              42.349115507292765
+            ],
+            [
+              -119.72576474467019,
+              44.52213134673417
+            ],
+            [
+              -119.09608401846845,
+              46.50994697258665
+            ],
+            [
+              -117.25642856348685,
+              47.06554761335286
+            ],
+            [
+              -114.9722925958924,
+              46.59637373892815
+            ],
+            [
+              -114.55250544509119,
+              45.102425349312284
+            ],
+            [
+              -114.1080249324782,
+              44.69498487941701
+            ],
+            [
+              -114.02159816613681,
+              42.73186261537637
+            ],
+            [
+              -114.3055718269729,
+              42.13922193189239
+            ],
+            [
+              -117.4416287770756,
+              42.08983520826865
+            ],
+            [
+              -118.83680371944423,
+              42.04044848464497
+            ],
+            [
+              -118.861497081256,
+              42.01575512283307
+            ],
+            [
+              -119.33067095568084,
+              42.349115507292765
+            ]
+          ]
+        ]
+      },
+      "properties": {
+        "name": "User AOI",
+        "export_date": "2026-01-13T01:00:15.841415",
+        "vmrc_report": {
+          "export_date": "2026-01-13T01:00:15.312878",
+          "export_id": "54b5dfdb",
+          "software": "VMRC Portal",
+          "raster": {
+            "name": "HSL_100_NORMAL.tif",
+            "path": "D:\\VMRC_Project\\Data_Analysis!!\\Nov20\\HighStressMortality\\Western_Hemlock\\100\\HSL_100_NORMAL.tif"
+          },
+          "context": {
+            "mapType": "hsl",
+            "species": "Western Hemlock",
+            "coverPercent": "100",
+            "condition": "N",
+            "month": null,
+            "stressLevel": null,
+            "hslClass": null,
+            "selectedRasterName": "HSL_100_NORMAL",
+            "selectedRasterPath": "D:\\VMRC_Project\\Data_Analysis!!\\Nov20\\HighStressMortality\\Western_Hemlock\\100\\HSL_100_NORMAL.tif"
+          },
+          "aoi": {
+            "bounds": {
+              "west": -119.73212858595456,
+              "south": 42.01139803322832,
+              "east": -114.01546191951655,
+              "north": 47.06973136635932
+            }
+          },
+          "statistics": {
+            "min": 0.33235663175582886,
+            "max": 100.0,
+            "mean": 51.81051754977488,
+            "std": 32.55227267559973,
+            "count": 323338,
+            "median": 49.22934150695801,
+            "percentiles": {
+              "p10": 7.4471025466918945,
+              "p25": 23.327653884887695,
+              "p50": 49.22859573364258,
+              "p75": 83.00037384033203,
+              "p90": 98.94597625732422
+            }
+          },
+          "histogram": {
+            "bins": [
+              {
+                "range": "0\u201310",
+                "count": 5980,
+                "percentage": 11.959999999999999
+              },
+              {
+                "range": "10\u201320",
+                "count": 4596,
+                "percentage": 9.192
+              },
+              {
+                "range": "20\u201330",
+                "count": 5444,
+                "percentage": 10.888
+              },
+              {
+                "range": "30\u201340",
+                "count": 4963,
+                "percentage": 9.926
+              },
+              {
+                "range": "40\u201350",
+                "count": 4372,
+                "percentage": 8.744
+              },
+              {
+                "range": "50\u201360",
+                "count": 3903,
+                "percentage": 7.806
+              },
+              {
+                "range": "60\u201370",
+                "count": 3671,
+                "percentage": 7.342
+              },
+              {
+                "range": "70\u201380",
+                "count": 3427,
+                "percentage": 6.854
+              },
+              {
+                "range": "80\u201390",
+                "count": 3927,
+                "percentage": 7.854
+              },
+              {
+                "range": "90\u2013100",
+                "count": 9717,
+                "percentage": 19.434
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

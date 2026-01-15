@@ -4,12 +4,23 @@ import react from "@vitejs/plugin-react-swc";
 export default defineConfig({
   plugins: [react()],
   resolve: {
-    alias: {
-      "@": "/src",
-    },
+    alias: { "@": "/src" },
   },
   server: {
+    host: true,
     port: 5173,
-    allowedHosts: true, // ✅ allow Cloudflare tunnel host for 1-day demo
+    allowedHosts: true,
+    proxy: {
+      "/api": {
+        target: "http://127.0.0.1:8000",
+        changeOrigin: true,
+        secure: false,
+      },
+      "/static": {
+        target: "http://127.0.0.1:8000",
+        changeOrigin: true,
+        secure: false,
+      },
+    },
   },
 });

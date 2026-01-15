@@ -1,6 +1,7 @@
 // src/components/raster/CreatedRastersList.jsx
 
-import { useState } from "react";
+import { apiUrl } from "../../lib/rasterApi";
+import "./CreatedRastersList.css";
 
 // Color ramp matching BaseMap.jsx LEGEND_ITEMS
 const LEGEND_COLORS = [
@@ -43,7 +44,7 @@ function LegendBar({ ramp }) {
         borderRadius: "2px",
         overflow: "hidden",
         border: "1px solid #e5e7eb",
-        marginTop: "4px",
+        marginTop: "8px",
       }}
     >
       {colors.map((color, i) => (
@@ -75,8 +76,16 @@ function RasterItem({ raster, isActive, onShow, onRemove }) {
     day: "numeric",
   });
 
+  // Convert overlayUrl to absolute URL
+  const overlayImageUrl = raster.overlayUrl
+    ? raster.overlayUrl.startsWith("http")
+      ? raster.overlayUrl
+      : apiUrl(raster.overlayUrl)
+    : null;
+
   return (
     <div
+      className={`raster-item ${isActive ? "raster-item-active" : ""}`}
       style={{
         padding: "10px",
         border: `1px solid ${isActive ? "#2563eb" : "#e5e7eb"}`,
@@ -91,12 +100,36 @@ function RasterItem({ raster, isActive, onShow, onRemove }) {
           fontSize: "13px",
           fontWeight: 600,
           color: "#111827",
-          marginBottom: "6px",
+          marginBottom: "8px",
           wordBreak: "break-word",
         }}
       >
         {raster.name}
       </div>
+
+      {/* PNG Thumbnail with checkerboard background */}
+      {overlayImageUrl && (
+        <div
+          className="raster-thumbnail-container"
+          onClick={onShow}
+          style={{
+            cursor: "pointer",
+            marginBottom: "8px",
+          }}
+          title="Click to activate this raster"
+        >
+          <div className="raster-thumbnail-checkerboard">
+            <img
+              src={overlayImageUrl}
+              alt="Raster preview"
+              className="raster-thumbnail-image"
+              onError={(e) => {
+                e.target.style.display = "none";
+              }}
+            />
+          </div>
+        </div>
+      )}
 
       {/* Legend Bar */}
       <LegendBar ramp={raster.ramp} />
@@ -163,6 +196,7 @@ export default function CreatedRastersList({
   activeRasterId = null,
   onShowRaster,
   onRemoveRaster,
+  onClearAll = null,
 }) {
   if (rasters.length === 0) {
     return (
@@ -187,16 +221,43 @@ export default function CreatedRastersList({
         padding: "12px",
       }}
     >
-      <h3
+      <div
         style={{
-          fontSize: "16px",
-          fontWeight: 700,
-          color: "#111827",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
           marginBottom: "12px",
         }}
       >
-        Created Rasters ({rasters.length})
-      </h3>
+        <h3
+          style={{
+            fontSize: "16px",
+            fontWeight: 700,
+            color: "#111827",
+            margin: 0,
+          }}
+        >
+          Created Rasters ({rasters.length})
+        </h3>
+        {onClearAll && (
+          <button
+            onClick={onClearAll}
+            style={{
+              padding: "6px 12px",
+              fontSize: "12px",
+              background: "#ef4444",
+              color: "#ffffff",
+              border: "none",
+              borderRadius: "4px",
+              cursor: "pointer",
+              fontWeight: 500,
+            }}
+            title="Remove all rasters from map and list"
+          >
+            Clear All
+          </button>
+        )}
+      </div>
 
       {rasters.map((raster) => (
         <RasterItem
@@ -210,4 +271,3 @@ export default function CreatedRastersList({
     </div>
   );
 }
-

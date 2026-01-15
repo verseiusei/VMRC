@@ -31,13 +31,10 @@ ImportError: No module named 'osgeo'
 ### If you used Conda
 
 ```bash
-conda install -c conda-forge gdal python-gdal
+conda install -c conda-forge gdal
 ```
 
-Or if GDAL is already installed:
-```bash
-conda install -c conda-forge python-gdal
-```
+**Note:** The package name is `gdal`, not `python-gdal`. Installing `gdal` from conda-forge includes both CLI tools and Python bindings.
 
 Verify:
 ```bash
@@ -92,8 +89,8 @@ The easiest way to ensure everything works:
 ```bash
 conda create -n vmrc python=3.10
 conda activate vmrc
-conda install -c conda-forge gdal python-gdal rasterio pyproj pillow numpy
+conda install -c conda-forge gdal rasterio pyproj pillow numpy
 ```
 
-This installs GDAL CLI, Python bindings, and all dependencies in one go.
+**Note:** Just install `gdal` - it includes both CLI tools and Python bindings. This installs GDAL CLI, Python bindings, and all dependencies in one go.
 

@@ -1,0 +1,97 @@
+{
+  "export_date": "2026-01-14T15:15:53.114677",
+  "export_id": "a70d2175",
+  "software": "VMRC Portal",
+  "raster": {
+    "name": "HSL2.5_DF_50_D_l.tif",
+    "path": "D:\\VMRC_Project\\Data_Analysis!!\\Nov20\\HighStressMortality\\Douglas_Fir\\50\\l\\HSL2.5_DF_50_D_l.tif"
+  },
+  "context": {
+    "mapType": "hsl",
+    "species": "Douglas-fir",
+    "coverPercent": "50",
+    "condition": "D",
+    "month": null,
+    "stressLevel": null,
+    "hslClass": "l",
+    "selectedRasterName": "HSL2.5_DF_50_D_l.tif",
+    "selectedRasterPath": "D:\\VMRC_Project\\Data_Analysis!!\\Nov20\\HighStressMortality\\Douglas_Fir\\50\\l\\HSL2.5_DF_50_D_l.tif"
+  },
+  "aoi": {
+    "bounds": {
+      "west": -122.33212858585055,
+      "south": 44.23639803313932,
+      "east": -120.88212858590856,
+      "north": 45.703064699747316
+    }
+  },
+  "statistics": {
+    "min": 0.005965768359601498,
+    "max": 99.62142944335938,
+    "mean": 65.54968418151233,
+    "std": 39.91954862727288,
+    "count": 29817,
+    "median": 90.08133697509766,
+    "percentiles": {
+      "p10": 0.9713876843452454,
+      "p25": 19.592086791992188,
+      "p50": 90.08133697509766,
+      "p75": 99.21682739257812,
+      "p90": 99.61296081542969
+    }
+  },
+  "histogram": {
+    "bins": [
+      {
+        "range": "0\u201310",
+        "count": 6260,
+        "percentage": 20.99473454740584
+      },
+      {
+        "range": "10\u201320",
+        "count": 1236,
+        "percentage": 4.145286246101217
+      },
+      {
+        "range": "20\u201330",
+        "count": 833,
+        "percentage": 2.793708287218701
+      },
+      {
+        "range": "30\u201340",
+        "count": 685,
+        "percentage": 2.2973471509541534
+      },
+      {
+        "range": "40\u201350",
+        "count": 716,
+        "percentage": 2.401314686252809
+      },
+      {
+        "range": "50\u201360",
+        "count": 793,
+        "percentage": 2.659556628768823
+      },
+      {
+        "range": "60\u201370",
+        "count": 987,
+        "percentage": 3.3101921722507295
+      },
+      {
+        "range": "70\u201380",
+        "count": 1304,
+        "percentage": 4.37334406546601
+      },
+      {
+        "range": "80\u201390",
+        "count": 2065,
+        "percentage": 6.92557936747493
+      },
+      {
+        "range": "90\u2013100",
+        "count": 14938,
+        "percentage": 50.09893684810679
+      }
+    ]
+  }
+}

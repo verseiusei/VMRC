@@ -1,14 +1,15 @@
 # app/api/v1/routes_raster_export.py
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel
 from app.services.raster_service import clip_raster_for_layer, resolve_raster_path
 from pathlib import Path
 import rasterio
 from rasterio.mask import mask
+from rasterio.warp import transform_geom
 from shapely.geometry import shape, mapping, Polygon, MultiPolygon
 from shapely.validation import make_valid
-from shapely.ops import transform as shapely_transform, unary_union
-from pyproj import Transformer
+from shapely.ops import unary_union
 import numpy as np
 import csv
 import json
@@ -20,6 +21,8 @@ import base64
 from io import BytesIO
 import xml.etree.ElementTree as ET
 import os
+import zipfile
+import shutil
 
 # Try to import requests for image fetching
 try:
@@ -31,12 +34,14 @@ except ImportError:
 
 # PDF generation imports
 try:
-    from reportlab.lib.pagesizes import letter, A4
+    from reportlab.lib.pagesizes import letter, A4, landscape
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak, KeepTogether
     from reportlab.lib import colors
     from reportlab.pdfgen import canvas
+    # Note: ImageReader is only for canvas.drawImage(), not for Platypus Image flowable
+    # For Platypus Image, use BytesIO directly
     HAS_REPORTLAB = True
 except ImportError:
     HAS_REPORTLAB = False
@@ -50,6 +55,20 @@ class ExportRequest(BaseModel):
     formats: List[str] = []  # ["png", "tif", "csv", "geojson", "json", "pdf"]
     filename: Optional[str] = None
     context: Optional[Dict[str, Any]] = None  # UI selections for PDF report
+    overlay_url: Optional[str] = None  # Optional: use existing PNG overlay instead of re-clipping
+    aoi_name: Optional[str] = None  # Optional: AOI name for PDF title (e.g., "Uploaded AOI" or filename)
+    overlay_urls: Optional[List[Dict[str, Any]]] = None  # Optional: array of {overlay_url, aoi_name, user_clip_geojson} for multi-AOI PDF
+
+
+class PDFExportRequest(BaseModel):
+    """Request model for dedicated PDF export endpoint."""
+    raster_layer_id: int
+    user_clip_geojson: dict
+    filename: Optional[str] = None  # Auto-generated if not provided
+    context: Optional[Dict[str, Any]] = None  # UI selections: mapType, species, condition, month, coverPercent, etc.
+    aoi_name: Optional[str] = None  # Optional: AOI name for report header
+    overlay_url: Optional[str] = None  # Optional: use existing PNG overlay (must include stats in context)
+    stats: Optional[Dict[str, Any]] = None  # Optional: pre-computed stats (if overlay_url is provided)
 
 
 def sanitize_filename(name: str) -> str:
@@ -99,6 +118,164 @@ def get_histogram_bin_ranges() -> List[str]:
     """Get histogram bin range labels with en dash (prevents Excel auto-formatting)."""
     return ["0–10", "10–20", "20–30", "30–40", "40–50",
             "50–60", "60–70", "70–80", "80–90", "90–100"]
+
+
+def compute_expanded_stats(stats: Dict[str, Any], histogram: Optional[Dict[str, Any]] = None, valid_pixels: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    """
+    Compute expanded statistics matching the UI cards:
+    - Area by Threshold (High >=70, Moderate-High >=50, Low <=30)
+    - Most Common Value Range (Dominant Range + Coverage %)
+    
+    Args:
+        stats: Basic stats dict with min, max, mean, std, count
+        histogram: Optional histogram dict with bins, counts, percentages
+        valid_pixels: Optional numpy array of valid pixel values (if histogram not available)
+    
+    Returns:
+        Expanded stats dict with threshold areas and dominant range
+    """
+    expanded = {}
+    
+    # Get pixel counts for thresholds
+    if histogram and "counts" in histogram:
+        # Use histogram counts (10 bins: 0-10, 10-20, ..., 90-100)
+        bin_counts = np.array(histogram["counts"])
+        total_pixels = histogram.get("total_valid_pixels", bin_counts.sum())
+        
+        # Threshold calculations based on bin ranges
+        # High >= 70: bins 7, 8, 9 (70-80, 80-90, 90-100)
+        high_count = bin_counts[7:].sum() if len(bin_counts) >= 10 else 0
+        high_percent = (high_count / total_pixels * 100) if total_pixels > 0 else 0
+        
+        # Moderate-High >= 50: bins 5, 6, 7, 8, 9 (50-60, 60-70, 70-80, 80-90, 90-100)
+        moderate_high_count = bin_counts[5:].sum() if len(bin_counts) >= 10 else 0
+        moderate_high_percent = (moderate_high_count / total_pixels * 100) if total_pixels > 0 else 0
+        
+        # Low <= 30: bins 0, 1, 2, 3 (0-10, 10-20, 20-30, 30-40)
+        low_count = bin_counts[:4].sum() if len(bin_counts) >= 4 else 0
+        low_percent = (low_count / total_pixels * 100) if total_pixels > 0 else 0
+        
+        # Most Common Value Range (dominant bin)
+        dominant_bin_idx = int(np.argmax(bin_counts))
+        bin_ranges = get_histogram_bin_ranges()
+        dominant_range = bin_ranges[dominant_bin_idx] if dominant_bin_idx < len(bin_ranges) else "Unknown"
+        dominant_count = int(bin_counts[dominant_bin_idx])
+        dominant_percent = (dominant_count / total_pixels * 100) if total_pixels > 0 else 0
+        
+        expanded["area_by_threshold"] = {
+            "high": {"count": int(high_count), "percent": float(high_percent)},
+            "moderate_high": {"count": int(moderate_high_count), "percent": float(moderate_high_percent)},
+            "low": {"count": int(low_count), "percent": float(low_percent)},
+        }
+        expanded["most_common_range"] = {
+            "range": dominant_range,
+            "count": int(dominant_count),
+            "percent": float(dominant_percent),
+        }
+    elif valid_pixels is not None and len(valid_pixels) > 0:
+        # Compute from pixel values directly
+        total_pixels = len(valid_pixels)
+        
+        high_count = np.sum(valid_pixels >= 70)
+        moderate_high_count = np.sum(valid_pixels >= 50)
+        low_count = np.sum(valid_pixels <= 30)
+        
+        high_percent = (high_count / total_pixels * 100) if total_pixels > 0 else 0
+        moderate_high_percent = (moderate_high_count / total_pixels * 100) if total_pixels > 0 else 0
+        low_percent = (low_count / total_pixels * 100) if total_pixels > 0 else 0
+        
+        # Most common range: find which bin has most pixels
+        bin_counts = np.zeros(10, dtype=int)
+        for v in valid_pixels:
+            clamped = max(0, min(100, v))
+            idx = 9 if clamped == 100 else max(0, min(9, int(np.floor(clamped / 10))))
+            bin_counts[idx] += 1
+        
+        dominant_bin_idx = int(np.argmax(bin_counts))
+        bin_ranges = get_histogram_bin_ranges()
+        dominant_range = bin_ranges[dominant_bin_idx] if dominant_bin_idx < len(bin_ranges) else "Unknown"
+        dominant_count = int(bin_counts[dominant_bin_idx])
+        dominant_percent = (dominant_count / total_pixels * 100) if total_pixels > 0 else 0
+        
+        expanded["area_by_threshold"] = {
+            "high": {"count": int(high_count), "percent": float(high_percent)},
+            "moderate_high": {"count": int(moderate_high_count), "percent": float(moderate_high_percent)},
+            "low": {"count": int(low_count), "percent": float(low_percent)},
+        }
+        expanded["most_common_range"] = {
+            "range": dominant_range,
+            "count": int(dominant_count),
+            "percent": float(dominant_percent),
+        }
+    else:
+        # Fallback: set defaults
+        expanded["area_by_threshold"] = {
+            "high": {"count": 0, "percent": 0.0},
+            "moderate_high": {"count": 0, "percent": 0.0},
+            "low": {"count": 0, "percent": 0.0},
+        }
+        expanded["most_common_range"] = {
+            "range": "Unknown",
+            "count": 0,
+            "percent": 0.0,
+        }
+    
+    return expanded
+
+
+def render_clipped_preview_png(raster_layer_id: int, user_clip_geojson: dict) -> bytes:
+    """
+    Generate PNG preview of clipped raster (same as map overlay).
+    
+    This function reuses clip_raster_for_layer() to generate the same PNG
+    that's used in the UI, ensuring colors and classification match exactly.
+    
+    Args:
+        raster_layer_id: ID of the raster layer to clip
+        user_clip_geojson: GeoJSON polygon defining the AOI (EPSG:4326)
+    
+    Returns:
+        PNG image bytes (RGBA with transparency)
+    
+    Raises:
+        ValueError: If PNG generation fails
+    """
+    from app.services.raster_service import clip_raster_for_layer
+    
+    print(f"[PNG PREVIEW] Generating clipped raster preview for layer {raster_layer_id}...")
+    
+    try:
+        # Use clip_raster_for_layer to get the same PNG as the UI
+        clip_result = clip_raster_for_layer(
+            raster_layer_id=raster_layer_id,
+            user_clip_geojson=user_clip_geojson,
+            zoom=None  # Use native resolution for PDF
+        )
+        
+        # Extract PNG overlay URL
+        overlay_url = clip_result.get("overlay_url", "")
+        if not overlay_url:
+            raise ValueError("clip_raster_for_layer did not return overlay_url")
+        
+        # Load PNG bytes from file
+        overlay_filename = Path(overlay_url).name
+        overlay_path = Path("static/overlays") / overlay_filename
+        
+        if not overlay_path.exists():
+            raise ValueError(f"PNG overlay file not found: {overlay_path}")
+        
+        with open(overlay_path, "rb") as f:
+            png_bytes = f.read()
+        
+        print(f"[PNG PREVIEW] ✓ Generated PNG preview ({len(png_bytes)} bytes)")
+        return png_bytes
+        
+    except Exception as e:
+        error_msg = f"Failed to generate PNG preview: {str(e)}"
+        print(f"[PNG PREVIEW] ERROR: {error_msg}")
+        import traceback
+        traceback.print_exc()
+        raise ValueError(error_msg)
 
 
 def build_arcgis_metadata(context: Optional[Dict[str, Any]], raster_name: str) -> Dict[str, str]:
@@ -394,6 +571,64 @@ def write_arcgis_tif_xml(tif_path: Path, metadata: Dict[str, str]) -> Optional[s
         return None
 
 
+def create_tif_zip(tif_path: Path, zip_path: Path) -> bool:
+    """
+    Create a ZIP file containing the GeoTIFF and its associated metadata files.
+    
+    Includes:
+    - The .tif file
+    - The .tif.xml metadata file (if exists)
+    - Any .aux.xml files (if exists)
+    
+    Args:
+        tif_path: Path to the GeoTIFF file
+        zip_path: Path where the ZIP file should be created
+        
+    Returns:
+        True if zip was created successfully, False otherwise
+    """
+    try:
+        print(f"[EXPORT] Creating ZIP archive: {zip_path}")
+        
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # Add the main .tif file
+            if tif_path.exists():
+                zipf.write(tif_path, tif_path.name)
+                print(f"[EXPORT] Added to ZIP: {tif_path.name}")
+            else:
+                print(f"[EXPORT] WARNING: TIF file not found: {tif_path}")
+                return False
+            
+            # Add .tif.xml metadata file (ArcGIS sidecar)
+            xml_path = Path(str(tif_path) + ".xml")
+            if xml_path.exists():
+                zipf.write(xml_path, xml_path.name)
+                print(f"[EXPORT] Added to ZIP: {xml_path.name}")
+            else:
+                print(f"[EXPORT] Note: XML metadata file not found: {xml_path}")
+            
+            # Add .aux.xml file if it exists (GDAL auxiliary file)
+            aux_xml_path = Path(str(tif_path) + ".aux.xml")
+            if aux_xml_path.exists():
+                zipf.write(aux_xml_path, aux_xml_path.name)
+                print(f"[EXPORT] Added to ZIP: {aux_xml_path.name}")
+        
+        # Verify zip was created
+        if zip_path.exists() and zip_path.stat().st_size > 0:
+            zip_size = zip_path.stat().st_size
+            print(f"[EXPORT] ✓ ZIP archive created successfully: {zip_path.name} ({zip_size:,} bytes)")
+            return True
+        else:
+            print(f"[EXPORT] ERROR: ZIP file was not created or is empty")
+            return False
+            
+    except Exception as e:
+        print(f"[EXPORT] ERROR: Failed to create ZIP archive: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def fetch_image_as_base64(image_url: str, base_url: str = "http://127.0.0.1:8000") -> Optional[str]:
     """
     Fetch an image from URL and convert to base64 data URL.
@@ -438,6 +673,593 @@ def fetch_image_as_base64(image_url: str, base_url: str = "http://127.0.0.1:8000
     except Exception as e:
         print(f"[EXPORT] Warning: Failed to fetch image as base64: {e}")
         return None
+
+
+def build_pdf_report_landscape(
+    title: str,
+    png_bytes: bytes,
+    stats: Dict[str, Any],
+    legend_bins: List[Dict[str, Any]],
+    aoi_name: Optional[str] = None,
+    raster_name: Optional[str] = None,
+    raster_crs: Optional[Any] = None,
+    context: Optional[Dict[str, Any]] = None
+) -> bytes:
+    """
+    Build a professional PDF report in landscape orientation with raster map and statistics.
+    
+    Layout:
+    - Header: Project name, dataset info, date
+    - Map section: Large raster preview with legend
+    - Statistics section: Complete stats table
+    - Footer: Projection, data source, credits
+    
+    Args:
+        title: Report title (dataset name + params)
+        png_bytes: PNG image bytes (colorized raster overlay - same as UI)
+        stats: Statistics dict with min, max, mean, median, std, count (same as UI)
+        legend_bins: List of legend bin dicts with {range, color, label}
+        aoi_name: Optional AOI name
+        raster_name: Optional raster file name
+        raster_crs: Optional raster CRS for footer
+        context: Optional context dict with filter selections
+    
+    Returns:
+        PDF bytes ready for download
+    """
+    if not HAS_REPORTLAB:
+        raise ValueError("reportlab not installed")
+    
+    # Create in-memory PDF buffer
+    pdf_buffer = BytesIO()
+    
+    # Create PDF document in landscape orientation
+    landscape_size = landscape(letter)  # 11" x 8.5"
+    doc = SimpleDocTemplate(
+        pdf_buffer,
+        pagesize=landscape_size,
+        topMargin=0.5*inch,
+        bottomMargin=0.5*inch,
+        leftMargin=0.5*inch,
+        rightMargin=0.5*inch
+    )
+    story = []
+    styles = getSampleStyleSheet()
+    
+    # ============================================================
+    # HEADER: Project name + Dataset info + Date
+    # ============================================================
+    header_style = ParagraphStyle(
+        'HeaderStyle',
+        parent=styles['Heading1'],
+        fontSize=20,
+        textColor=colors.HexColor('#111827'),
+        spaceAfter=10,
+        alignment=1,  # Center
+    )
+    
+    story.append(Paragraph("<b>VMRC Portal - Export Report</b>", header_style))
+    story.append(Spacer(1, 0.1*inch))
+    
+    # Dataset title
+    title_style = ParagraphStyle(
+        'TitleStyle',
+        parent=styles['Heading2'],
+        fontSize=16,
+        textColor=colors.HexColor('#374151'),
+        spaceAfter=8,
+        alignment=1,  # Center
+    )
+    story.append(Paragraph(title, title_style))
+    
+    # AOI Name and Date
+    info_data = []
+    if aoi_name:
+        info_data.append(["AOI:", aoi_name])
+    info_data.append(["Export Date:", datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+    if raster_name:
+        info_data.append(["Dataset:", raster_name])
+    
+    if info_data:
+        info_table = Table(info_data, colWidths=[1.5*inch, 4*inch])
+        info_table.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        story.append(info_table)
+    
+    story.append(Spacer(1, 0.2*inch))
+    
+    # ============================================================
+    # MAIN CONTENT: Two-column layout (Map + Stats)
+    # ============================================================
+    # Left column: Map with legend
+    # Right column: Statistics
+    
+    # Load PNG image
+    try:
+        # For Platypus Image, use BytesIO directly (not ImageReader)
+        # First, get image dimensions using PIL
+        try:
+            from PIL import Image as PILImage
+            pil_img = PILImage.open(BytesIO(png_bytes))
+            img_width_px, img_height_px = pil_img.size
+            aspect_ratio = img_height_px / img_width_px if img_width_px > 0 else 1.0
+        except ImportError:
+            # Fallback: assume square if PIL not available
+            print("[PDF] Warning: PIL not available, using default aspect ratio")
+            img_width_px, img_height_px = 800, 800
+            aspect_ratio = 1.0
+        
+        # Fit to available width in landscape (about 4.5 inches for left column)
+        max_img_width = 4.5 * inch
+        img_width = max_img_width
+        img_height = img_width * aspect_ratio
+        
+        # Limit height to prevent overflow
+        max_img_height = 5.5 * inch
+        if img_height > max_img_height:
+            img_height = max_img_height
+            img_width = img_height / aspect_ratio
+        
+        # Create Image flowable from BytesIO (not ImageReader)
+        img = Image(BytesIO(png_bytes), width=img_width, height=img_height)
+        
+        # Map section with border
+        map_table = Table([[img]], colWidths=[max_img_width])
+        map_table.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#d1d5db')),
+            ('BACKGROUND', (0, 0), (-1, -1), colors.white),
+        ]))
+        
+        map_section = [
+            Paragraph("<b>Raster Map</b>", styles['Heading3']),
+            Spacer(1, 0.1*inch),
+            map_table,
+        ]
+        
+        print(f"[PDF] ✓ Embedded raster map ({img_width_px}x{img_height_px} px)")
+    except Exception as img_err:
+        print(f"[PDF] Warning: Failed to embed image: {img_err}")
+        import traceback
+        traceback.print_exc()
+        map_section = [
+            Paragraph("<b>Raster Map</b>", styles['Heading3']),
+            Paragraph("Map image unavailable", styles['Normal']),
+        ]
+    
+    # Legend
+    legend_colors = [
+        colors.HexColor('#006400'), colors.HexColor('#228B22'),
+        colors.HexColor('#9ACD32'), colors.HexColor('#FFD700'),
+        colors.HexColor('#FFA500'), colors.HexColor('#FF8C00'),
+        colors.HexColor('#FF6B00'), colors.HexColor('#FF4500'),
+        colors.HexColor('#DC143C'), colors.HexColor('#B22222'),
+    ]
+    legend_ranges = ["0–10", "10–20", "20–30", "30–40", "40–50",
+                     "50–60", "60–70", "70–80", "80–90", "90–100"]
+    
+    legend_data = [["Color", "Range (%)"]]
+    for range_label in legend_ranges:
+        legend_data.append(["", range_label])
+    
+    legend_table = Table(legend_data, colWidths=[0.8*inch, 1.2*inch])
+    legend_style = TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#374151')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+    ])
+    # Add color backgrounds
+    for i in range(10):
+        legend_style.add('BACKGROUND', (0, i+1), (0, i+1), legend_colors[i])
+    legend_table.setStyle(legend_style)
+    
+    map_section.append(Spacer(1, 0.15*inch))
+    map_section.append(Paragraph("<b>Legend</b>", styles['Heading3']))
+    map_section.append(Spacer(1, 0.05*inch))
+    map_section.append(legend_table)
+    
+    # Statistics section
+    stats_data = [
+        ["Metric", "Value"],
+        ["Count", str(stats.get("count", 0))],
+        ["Min", f"{stats.get('min', 0):.2f}"],
+        ["Max", f"{stats.get('max', 0):.2f}"],
+        ["Mean", f"{stats.get('mean', 0):.2f}"],
+        ["Median", f"{stats.get('median', 0):.2f}" if stats.get('median') is not None else "N/A"],
+        ["Std Dev", f"{stats.get('std', 0):.2f}"],
+    ]
+    
+    stats_table = Table(stats_data, colWidths=[2*inch, 2.5*inch])
+    stats_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#374151')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('BACKGROUND', (0, 1), (0, -1), colors.HexColor('#f9fafb')),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#111827')),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
+    ]))
+    
+    stats_section = [
+        Paragraph("<b>Statistics Summary</b>", styles['Heading3']),
+        Spacer(1, 0.1*inch),
+        stats_table,
+    ]
+    
+    # Create two-column layout
+    from reportlab.platypus import KeepTogether
+    left_col = KeepTogether(map_section)
+    right_col = KeepTogether(stats_section)
+    
+    two_col_table = Table([[left_col, right_col]], colWidths=[5*inch, 4.5*inch])
+    two_col_table.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('LEFTPADDING', (0, 0), (0, -1), 0),
+        ('RIGHTPADDING', (1, 0), (1, -1), 0),
+    ]))
+    
+    story.append(two_col_table)
+    story.append(Spacer(1, 0.2*inch))
+    
+    # ============================================================
+    # FOOTER: Projection, Data Source, Credits
+    # ============================================================
+    footer_data = []
+    if raster_crs:
+        crs_str = str(raster_crs) if hasattr(raster_crs, '__str__') else str(raster_crs)
+        footer_data.append(["Projection:", crs_str])
+    footer_data.append(["Data Source:", "VMRC Portal"])
+    footer_data.append(["Generated:", datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+    
+    if footer_data:
+        footer_table = Table(footer_data, colWidths=[1.5*inch, 8*inch])
+        footer_table.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#6b7280')),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+            ('TOPPADDING', (0, 0), (-1, -1), 2),
+        ]))
+        story.append(footer_table)
+    
+    # Build PDF
+    doc.build(story)
+    
+    # Get PDF bytes
+    pdf_bytes = pdf_buffer.getvalue()
+    pdf_buffer.close()
+    
+    print(f"[PDF] ✓ Generated landscape PDF report ({len(pdf_bytes)} bytes)")
+    return pdf_bytes
+
+
+def build_pdf_report(
+    title: str,
+    png_bytes: Optional[bytes],
+    stats: Dict[str, Any],
+    legend_bins: List[Dict[str, Any]],
+    aoi_name: Optional[str] = None,
+    raster_name: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None
+) -> bytes:
+    """
+    Build a PDF report with raster image preview, legend, and statistics.
+    
+    The image is embedded from PNG bytes to ensure pixelated rendering (no smoothing).
+    Uses BytesIO directly with reportlab.platypus.Image (not ImageReader, which is for canvas.drawImage).
+    
+    Layout: Landscape orientation with header, map preview, legend, and expanded statistics.
+    Uses KeepTogether to prevent pagination issues.
+    
+    Args:
+        title: Report title (dataset name + params)
+        png_bytes: PNG image bytes (colorized raster overlay) - may be None if unavailable
+        stats: Statistics dict with min, max, mean, median, std, count, and expanded stats
+        legend_bins: List of legend bin dicts with {range, color, label}
+        aoi_name: Optional AOI name
+        raster_name: Optional raster file name
+        context: Optional context dict with filter selections
+    
+    Returns:
+        PDF bytes ready for download
+    """
+    if not HAS_REPORTLAB:
+        raise ValueError("reportlab not installed")
+    
+    # Create in-memory PDF buffer
+    pdf_buffer = BytesIO()
+    
+    # Create PDF document in landscape orientation (better for maps)
+    landscape_size = landscape(letter)  # 11" x 8.5"
+    doc = SimpleDocTemplate(
+        pdf_buffer,
+        pagesize=landscape_size,
+        topMargin=0.5*inch,
+        bottomMargin=0.5*inch,
+        leftMargin=0.5*inch,
+        rightMargin=0.5*inch
+    )
+    story = []
+    styles = getSampleStyleSheet()
+    
+    # ============================================================
+    # HEADER: Title + AOI name + timestamp
+    # ============================================================
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=20,
+        textColor=colors.HexColor('#111827'),
+        spaceAfter=15,
+        alignment=1,  # Center
+    )
+    story.append(Paragraph(title, title_style))
+    
+    # AOI Name and Date
+    info_data = []
+    if aoi_name:
+        info_data.append(["AOI:", aoi_name])
+    info_data.append(["Export Date:", datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+    if raster_name:
+        info_data.append(["Raster Name:", raster_name])
+    
+    if info_data:
+        info_table = Table(info_data, colWidths=[1.5*inch, 8*inch])
+        info_table.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        story.append(info_table)
+    
+    story.append(Spacer(1, 0.2*inch))
+    
+    # ============================================================
+    # RASTER IMAGE PREVIEW
+    # ============================================================
+    story.append(Paragraph("<b>Raster Preview</b>", styles['Heading2']))
+    story.append(Spacer(1, 0.1*inch))
+    
+    # Load PNG from bytes (for Platypus Image, use BytesIO directly, not ImageReader)
+    if png_bytes:
+        try:
+            # Get image dimensions using PIL to calculate aspect ratio
+            try:
+                from PIL import Image as PILImage
+                pil_img = PILImage.open(BytesIO(png_bytes))
+                img_width_px, img_height_px = pil_img.size
+                aspect_ratio = img_height_px / img_width_px if img_width_px > 0 else 1.0
+            except ImportError:
+                # Fallback: assume square if PIL not available
+                print("[PDF] Warning: PIL not available, using default aspect ratio")
+                img_width_px, img_height_px = 800, 800
+                aspect_ratio = 1.0
+            
+            # Fit to landscape page width (9.5 inches max, with margins)
+            max_width = 9.5 * inch
+            img_width = max_width
+            img_height = img_width * aspect_ratio
+            
+            # Limit height to prevent page overflow
+            max_height = 5.0 * inch
+            if img_height > max_height:
+                img_height = max_height
+                img_width = img_height / aspect_ratio
+            
+            # Create Image flowable from BytesIO directly (not ImageReader)
+            # ImageReader is only for canvas.drawImage(), not for Platypus Image
+            img = Image(BytesIO(png_bytes), width=img_width, height=img_height)
+            
+            # Wrap in table for centering and border
+            img_table = Table([[img]], colWidths=[max_width])
+            img_table.setStyle(TableStyle([
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#d1d5db')),  # Light gray border
+                ('BACKGROUND', (0, 0), (-1, -1), colors.white),
+            ]))
+            
+            story.append(img_table)
+            print(f"[PDF] ✓ Embedded raster preview image ({img_width_px}x{img_height_px} px, {img_width:.2f}x{img_height:.2f} inches)")
+        except Exception as img_err:
+            print(f"[PDF] ERROR: Failed to embed image: {img_err}")
+            import traceback
+            traceback.print_exc()
+            story.append(Paragraph(f"Preview image unavailable: {str(img_err)}", styles['Normal']))
+    else:
+        story.append(Paragraph("Preview image unavailable (PNG generation failed)", styles['Normal']))
+    
+    story.append(Spacer(1, 0.2*inch))
+    
+    # ============================================================
+    # LEGEND: Color bins (0–10, 10–20, ..., 90–100)
+    # ============================================================
+    story.append(Paragraph("<b>Legend</b>", styles['Heading2']))
+    story.append(Spacer(1, 0.1*inch))
+    
+    # Legend colors matching the colormap (same as UI)
+    legend_colors = [
+        colors.HexColor('#006400'),  # 0–10  dark green
+        colors.HexColor('#228B22'),  # 10–20
+        colors.HexColor('#9ACD32'),  # 20–30
+        colors.HexColor('#FFD700'),  # 30–40
+        colors.HexColor('#FFA500'),  # 40–50
+        colors.HexColor('#FF8C00'),  # 50–60
+        colors.HexColor('#FF6B00'),  # 60–70
+        colors.HexColor('#FF4500'),  # 70–80
+        colors.HexColor('#DC143C'),  # 80–90
+        colors.HexColor('#B22222'),  # 90–100
+    ]
+    
+    legend_ranges = ["0–10", "10–20", "20–30", "30–40", "40–50", "50–60", "60–70", "70–80", "80–90", "90–100"]
+    
+    # Build legend table: [Color Box, Range Label]
+    legend_data = [["Color", "Range (%)"]]
+    for range_label in legend_ranges:
+        legend_data.append(["", range_label])
+    
+    legend_table = Table(legend_data, colWidths=[1*inch, 1.5*inch])
+    legend_style = TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#374151')),  # Header background
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),  # Header text
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+    ])
+    # Color each row's first cell with the legend color
+    for i in range(10):
+        legend_style.add('BACKGROUND', (0, i+1), (0, i+1), legend_colors[i])
+    legend_table.setStyle(legend_style)
+    
+    story.append(legend_table)
+    story.append(Spacer(1, 0.3*inch))
+    
+    # ============================================================
+    # STATISTICS SUMMARY TABLE (Keep together to prevent pagination issues)
+    # ============================================================
+    stats_section = []
+    stats_section.append(Paragraph("<b>Statistics Summary</b>", styles['Heading2']))
+    stats_section.append(Spacer(1, 0.1*inch))
+    
+    # Calculate median if not provided
+    median = stats.get("median")
+    if median is None and stats.get("count", 0) > 0:
+        median = None
+    
+    stats_data = [
+        ["Metric", "Value"],
+        ["Count", str(stats.get("count", 0))],
+        ["Min", f"{stats.get('min', 0):.2f}"],
+        ["Max", f"{stats.get('max', 0):.2f}"],
+        ["Mean", f"{stats.get('mean', 0):.2f}"],
+        ["Median", f"{median:.2f}" if median is not None else "N/A"],
+        ["Std Dev", f"{stats.get('std', 0):.2f}"],
+    ]
+    
+    stats_table = Table(stats_data, colWidths=[2*inch, 3*inch])
+    stats_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#374151')),  # Header background
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),  # Header text
+        ('BACKGROUND', (0, 1), (0, -1), colors.HexColor('#f9fafb')),  # Label column background
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#111827')),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
+    ]))
+    stats_section.append(stats_table)
+    
+    # Use KeepTogether to prevent splitting the stats table across pages
+    story.append(KeepTogether(stats_section))
+    story.append(Spacer(1, 0.3*inch))
+    
+    # ============================================================
+    # EXPANDED STATISTICS: Area by Threshold
+    # ============================================================
+    if "area_by_threshold" in stats:
+        threshold_section = []
+        threshold_section.append(Paragraph("<b>Area by Threshold</b>", styles['Heading2']))
+        threshold_section.append(Spacer(1, 0.1*inch))
+        
+        threshold_data = [
+            ["Threshold", "Count", "Percentage"],
+            ["High (≥70%)", 
+             str(stats["area_by_threshold"]["high"]["count"]),
+             f"{stats['area_by_threshold']['high']['percent']:.2f}%"],
+            ["Moderate-High (≥50%)",
+             str(stats["area_by_threshold"]["moderate_high"]["count"]),
+             f"{stats['area_by_threshold']['moderate_high']['percent']:.2f}%"],
+            ["Low (≤30%)",
+             str(stats["area_by_threshold"]["low"]["count"]),
+             f"{stats['area_by_threshold']['low']['percent']:.2f}%"],
+        ]
+        
+        threshold_table = Table(threshold_data, colWidths=[2.5*inch, 1.5*inch, 1.5*inch])
+        threshold_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#374151')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('BACKGROUND', (0, 1), (0, -1), colors.HexColor('#f9fafb')),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#111827')),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),  # Numbers right-aligned
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
+        ]))
+        threshold_section.append(threshold_table)
+        
+        story.append(KeepTogether(threshold_section))
+        story.append(Spacer(1, 0.3*inch))
+    
+    # ============================================================
+    # EXPANDED STATISTICS: Most Common Value Range
+    # ============================================================
+    if "most_common_range" in stats:
+        range_section = []
+        range_section.append(Paragraph("<b>Most Common Value Range</b>", styles['Heading2']))
+        range_section.append(Spacer(1, 0.1*inch))
+        
+        range_data = [
+            ["Range", "Count", "Coverage"],
+            [stats["most_common_range"]["range"],
+             str(stats["most_common_range"]["count"]),
+             f"{stats['most_common_range']['percent']:.2f}%"],
+        ]
+        
+        range_table = Table(range_data, colWidths=[2*inch, 2*inch, 2*inch])
+        range_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#374151')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('BACKGROUND', (0, 1), (0, -1), colors.HexColor('#f9fafb')),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#111827')),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+        ]))
+        range_section.append(range_table)
+        
+        story.append(KeepTogether(range_section))
+    
+    # Build PDF
+    doc.build(story)
+    
+    # Get PDF bytes
+    pdf_bytes = pdf_buffer.getvalue()
+    pdf_buffer.close()
+    
+    print(f"[PDF] ✓ Generated PDF report ({len(pdf_bytes)} bytes)")
+    return pdf_bytes
 
 
 def normalize_for_export(geojson: dict) -> dict:
@@ -618,6 +1440,185 @@ def build_report_metadata(
     return report
 
 
+def export_multi_aoi_pdf(req: ExportRequest):
+    """
+    Generate a PDF with one page per AOI when multiple overlay URLs are provided.
+    """
+    if not HAS_REPORTLAB:
+        raise HTTPException(status_code=400, detail="reportlab not installed. Install with: pip install reportlab")
+    
+    if not req.overlay_urls or len(req.overlay_urls) == 0:
+        raise HTTPException(status_code=400, detail="overlay_urls must be provided for multi-AOI export")
+    
+    # Prepare output directory
+    export_id = uuid.uuid4().hex[:8]
+    base_filename = sanitize_filename(req.filename) if req.filename else generate_default_filename()
+    out_dir = Path("static/exports") / export_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    pdf_name = f"{base_filename}_report.pdf"
+    pdf_path = out_dir / pdf_name
+    
+    # Create PDF
+    doc = SimpleDocTemplate(str(pdf_path), pagesize=letter, topMargin=0.5*inch)
+    story = []
+    styles = getSampleStyleSheet()
+    
+    # Get raster name
+    try:
+        raster_path = resolve_raster_path(req.raster_layer_id)
+        raster_name = Path(raster_path).name
+    except Exception as e:
+        print(f"Warning: Could not resolve raster path: {e}")
+        raster_name = "unknown.tif"
+    
+    # Build dataset title from context
+    dataset_title = "VMRC Export Report"
+    if req.context:
+        dataset_parts = []
+        if req.context.get("mapType"):
+            dataset_parts.append(expand_map_type(req.context.get("mapType")))
+        if req.context.get("species"):
+            dataset_parts.append(req.context.get("species"))
+        if req.context.get("condition"):
+            dataset_parts.append(expand_condition(req.context.get("condition")))
+        if req.context.get("month"):
+            dataset_parts.append(f"Month {req.context.get('month')}")
+        if req.context.get("coverPercent"):
+            dataset_parts.append(f"Cover {req.context.get('coverPercent')}%")
+        if req.context.get("hslClass"):
+            dataset_parts.append(f"HSL Class {req.context.get('hslClass')}")
+        
+        if dataset_parts:
+            dataset_title = " · ".join(dataset_parts)
+    
+    # Generate one page per AOI
+    for idx, aoi_data in enumerate(req.overlay_urls):
+        overlay_url = aoi_data.get("overlay_url", "")
+        aoi_name = aoi_data.get("aoi_name", f"AOI {idx + 1}")
+        aoi_stats = aoi_data.get("stats", {})
+        aoi_bounds = aoi_data.get("bounds", {})
+        aoi_geojson = aoi_data.get("user_clip_geojson", req.user_clip_geojson)
+        
+        # Page break (except for first page)
+        if idx > 0:
+            story.append(PageBreak())
+        
+        # Title
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=24,
+            textColor=colors.HexColor('#111827'),
+            spaceAfter=30,
+        )
+        story.append(Paragraph(dataset_title, title_style))
+        story.append(Spacer(1, 0.2*inch))
+        
+        # AOI Name
+        story.append(Paragraph(f"<b>AOI:</b> {aoi_name}", styles['Normal']))
+        story.append(Spacer(1, 0.1*inch))
+        
+        # Date/Time
+        story.append(Paragraph(f"<b>Export Date:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
+        story.append(Spacer(1, 0.3*inch))
+        
+        # Raster Info
+        story.append(Paragraph("<b>Raster Information</b>", styles['Heading2']))
+        raster_table_data = [["Raster Name:", raster_name]]
+        raster_table = Table(raster_table_data, colWidths=[2*inch, 4.5*inch])
+        raster_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f9fafb')),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#111827')),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+        ]))
+        story.append(raster_table)
+        story.append(Spacer(1, 0.3*inch))
+        
+        # Statistics (if available)
+        if aoi_stats:
+            story.append(Paragraph("<b>Statistics</b>", styles['Heading2']))
+            stats_data = [
+                ["Count:", str(aoi_stats.get("count", "N/A"))],
+                ["Min:", f"{aoi_stats.get('min', 0):.2f}"],
+                ["Max:", f"{aoi_stats.get('max', 0):.2f}"],
+                ["Mean:", f"{aoi_stats.get('mean', 0):.2f}"],
+                ["Std Dev:", f"{aoi_stats.get('std', 0):.2f}"],
+            ]
+            stats_table = Table(stats_data, colWidths=[2*inch, 4.5*inch])
+            stats_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f9fafb')),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#111827')),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+            ]))
+            story.append(stats_table)
+            story.append(Spacer(1, 0.3*inch))
+        
+        # Preview Image
+        story.append(Paragraph("<b>Preview Image</b>", styles['Heading2']))
+        story.append(Spacer(1, 0.2*inch))
+        
+        try:
+            if overlay_url:
+                overlay_filename = Path(overlay_url).name
+                overlay_path = Path("static/overlays") / overlay_filename
+                
+                if overlay_path.exists():
+                    print(f"[EXPORT] Using local overlay file: {overlay_path}")
+                    try:
+                        img = Image(str(overlay_path), width=6.5*inch, height=6.5*inch, kind='proportional')
+                        img_table = Table([[img]], colWidths=[6.5*inch])
+                        img_table.setStyle(TableStyle([
+                            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#d1d5db')),
+                            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                        ]))
+                        story.append(img_table)
+                        print(f"[EXPORT] ✓ Preview image embedded for AOI: {aoi_name}")
+                    except Exception as local_err:
+                        print(f"[EXPORT] Warning: Failed to load local image: {local_err}")
+                        story.append(Paragraph("Preview unavailable", styles['Normal']))
+                else:
+                    data_url = fetch_image_as_base64(overlay_url)
+                    if data_url:
+                        img = Image(data_url, width=6.5*inch, height=6.5*inch, kind='proportional')
+                        img_table = Table([[img]], colWidths=[6.5*inch])
+                        img_table.setStyle(TableStyle([
+                            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#d1d5db')),
+                            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                        ]))
+                        story.append(img_table)
+                        print(f"[EXPORT] ✓ Preview image embedded from URL for AOI: {aoi_name}")
+                    else:
+                        story.append(Paragraph("Preview unavailable", styles['Normal']))
+            else:
+                story.append(Paragraph("Preview unavailable", styles['Normal']))
+        except Exception as img_err:
+            print(f"[EXPORT] Warning: Could not embed preview image for AOI {aoi_name}: {img_err}")
+            story.append(Paragraph("Preview unavailable", styles['Normal']))
+    
+    # Build PDF
+    print(f"[EXPORT] Building multi-AOI PDF document...")
+    doc.build(story)
+    print(f"[EXPORT] ✓ Multi-AOI PDF exported successfully: {pdf_path}")
+    
+    return {
+        "status": "success",
+        "files": {
+            "pdf": f"/static/exports/{export_id}/{pdf_name}"
+        }
+    }
+
+
 @router.post("/export")
 def export_raster(req: ExportRequest):
     """Exports clipped raster in multiple formats: PNG, TIF, CSV, GeoJSON, JSON, PDF."""
@@ -625,16 +1626,52 @@ def export_raster(req: ExportRequest):
     if not req.formats:
         raise HTTPException(status_code=400, detail="At least one format must be selected")
 
-    # Perform clip (same as map overlay process)
-    try:
-        clip_result = clip_raster_for_layer(
-            raster_layer_id=req.raster_layer_id,
-            user_clip_geojson=req.user_clip_geojson,
-        )
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=400, detail=f"Clip failed: {str(e)}")
+    # ============================================================
+    # HANDLE MULTI-AOI EXPORT (if overlay_urls provided)
+    # ============================================================
+    if req.overlay_urls and len(req.overlay_urls) > 0:
+        # Multi-AOI export: generate one PDF with one page per AOI
+        if "pdf" in req.formats:
+            return export_multi_aoi_pdf(req)
+        else:
+            # For non-PDF formats, export each AOI separately
+            # This is a simplified approach - could be enhanced
+            raise HTTPException(status_code=400, detail="Multi-AOI export currently only supports PDF format")
+
+    # ============================================================
+    # SINGLE AOI EXPORT (existing logic)
+    # ============================================================
+    # Use provided overlay_url if available (skip clipping), otherwise clip fresh
+    clip_result = None
+    if req.overlay_url:
+        # Use existing PNG overlay - get stats from context if available
+        print(f"[EXPORT] Using provided overlay_url: {req.overlay_url}")
+        # Get stats from context if provided (frontend should pass stats from createdRasters)
+        stats_from_context = {}
+        bounds_from_context = {}
+        if req.context:
+            if "stats" in req.context:
+                stats_from_context = req.context["stats"]
+            if "bounds" in req.context:
+                bounds_from_context = req.context["bounds"]
+        
+        clip_result = {
+            "overlay_url": req.overlay_url,
+            "stats": stats_from_context,
+            "bounds": bounds_from_context,
+        }
+        print(f"[EXPORT] Using stats from context: {stats_from_context}")
+    else:
+        # Perform clip (same as map overlay process)
+        try:
+            clip_result = clip_raster_for_layer(
+                raster_layer_id=req.raster_layer_id,
+                user_clip_geojson=req.user_clip_geojson,
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=400, detail=f"Clip failed: {str(e)}")
 
     # Prepare output directory
     export_id = uuid.uuid4().hex[:8]
@@ -764,26 +1801,55 @@ def export_raster(req: ExportRequest):
                     raster_crs = src.crs
                     print(f"[EXPORT] Raster CRS: {raster_crs}")
                     
-                    # Reproject geometry to raster CRS (same as clip_raster_for_layer)
-                    if raster_crs and raster_crs.to_string() != "EPSG:4326":
-                        print(f"[EXPORT] Reprojecting geometry from EPSG:4326 to {raster_crs}")
-                        transformer = Transformer.from_crs(
+                    # Reproject geometry to raster CRS using rasterio.warp.transform_geom (more precise)
+                    # Input is EPSG:4326 (GeoJSON), output should be in raster CRS
+                    print(f"[EXPORT] Reprojecting geometry from EPSG:4326 to {raster_crs}")
+                    aoi_geom_src = mapping(user_geom_4326)  # Convert shapely to GeoJSON dict
+                    aoi_geom_raster_crs = transform_geom(
                             "EPSG:4326",
-                            raster_crs,
-                            always_xy=True
+                        raster_crs.to_string() if hasattr(raster_crs, 'to_string') else str(raster_crs),
+                        aoi_geom_src,
+                        precision=6  # 6 decimal places for precision
                         )
-                        geom_for_mask = shapely_transform(transformer.transform, user_geom_4326)
-                    else:
-                        print(f"[EXPORT] No reprojection needed (raster is EPSG:4326)")
-                        geom_for_mask = user_geom_4326
+                    shapes = [aoi_geom_raster_crs]  # Use GeoJSON dict directly
                     
                     print(f"[EXPORT] Clipping raster with geometry...")
-                    geom_dict = mapping(geom_for_mask)
+                    
+                    # Determine nodata value: use source nodata if available, otherwise choose based on dtype
+                    nodata_value = src.nodata
+                    if nodata_value is None:
+                        # Choose a safe nodata value based on dtype
+                        if np.issubdtype(src.dtypes[0], np.integer):
+                            # For integer types, use a value outside typical range
+                            if src.dtypes[0] == np.uint8:
+                                nodata_value = 255
+                            elif src.dtypes[0] == np.uint16:
+                                nodata_value = 65535
+                            else:
+                                nodata_value = -9999
+                        else:
+                            # For float types
+                            nodata_value = -9999  # Use a sentinel value
+                        print(f"[EXPORT] Source has no nodata, using {nodata_value} as nodata value")
+                    
+                    # ============================================================
+                    # MASK RASTER: Use all_touched=True to include any touched pixel
+                    # ============================================================
+                    # all_touched=True ensures every pixel that is even slightly touched
+                    # by the AOI boundary is included. This guarantees no edge pixels are lost.
+                    #
+                    # Why this works:
+                    # - By default, mask() only includes pixels whose center falls inside the polygon
+                    # - all_touched=True includes ANY pixel touched or intersected by the boundary
+                    # - Combined with proper CRS reprojection, this ensures complete pixel coverage
+                    # ============================================================
                     clipped, out_transform = mask(
                         src,
-                        [geom_dict],
-                        crop=True,
-                        filled=False  # Preserve NoData
+                        shapes,  # GeoJSON geometry dict in raster CRS
+                        crop=True,  # Crop to geometry bounds (no pre-windowing needed)
+                        all_touched=True,  # CRITICAL: Include any pixel touched by boundary
+                        filled=True,  # Fill masked areas with nodata
+                        nodata=nodata_value  # Use source nodata or safe default
                     )
                     print(f"[EXPORT] Clipped shape: {clipped.shape}")
 
@@ -796,9 +1862,8 @@ def export_raster(req: ExportRequest):
                         "compress": "lzw",
                     })
                     
-                    # Preserve nodata value
-                    if src.nodata is not None:
-                        meta["nodata"] = src.nodata
+                    # Use the nodata value we set in mask() call
+                    meta["nodata"] = nodata_value
                     
                     # Build tags for metadata embedding
                     tags = {}
@@ -841,9 +1906,21 @@ def export_raster(req: ExportRequest):
                     xml_path_result = write_arcgis_tif_xml(tif_path, arcgis_metadata)
                     
                     print(f"[EXPORT] ✓ GeoTIFF exported successfully: {tif_path}")
-                    output_files["tif"] = f"/static/exports/{export_id}/{tif_name}"
                     
-                    # Include XML metadata path in response for debugging
+                    # Create ZIP file containing .tif and .tif.xml (and any .aux.xml)
+                    zip_name = f"{base_filename}.zip"
+                    zip_path = out_dir / zip_name
+                    
+                    if create_tif_zip(tif_path, zip_path):
+                        # Return ZIP file instead of individual .tif file
+                        output_files["tif"] = f"/static/exports/{export_id}/{zip_name}"
+                        print(f"[EXPORT] ✓ ZIP archive created: {zip_name}")
+                    else:
+                        # Fallback: return individual .tif file if ZIP creation failed
+                        output_files["tif"] = f"/static/exports/{export_id}/{tif_name}"
+                        print(f"[EXPORT] WARNING: ZIP creation failed, returning individual .tif file")
+                    
+                    # Include XML metadata path in response for debugging (even though it's in the ZIP)
                     if xml_path_result:
                         # Convert to relative path for API response
                         try:
@@ -1037,281 +2114,152 @@ def export_raster(req: ExportRequest):
             errors["pdf"] = error_msg
         else:
             try:
-                print(f"[EXPORT] Generating PDF report...")
+                print(f"[EXPORT] Generating PDF report with raster preview...")
                 pdf_name = f"{base_filename}_report.pdf"
                 pdf_path = out_dir / pdf_name
                 
-                # Create PDF
-                doc = SimpleDocTemplate(str(pdf_path), pagesize=letter, topMargin=0.5*inch)
-                story = []
-                styles = getSampleStyleSheet()
+                # ============================================================
+                # LOAD PNG OVERLAY BYTES (same colorized PNG as map overlay)
+                # ============================================================
+                png_bytes = None
+                overlay_url = req.overlay_url or clip_result.get("overlay_url", "")
                 
-                # Title
-                title_style = ParagraphStyle(
-                    'CustomTitle',
-                    parent=styles['Heading1'],
-                    fontSize=24,
-                    textColor=colors.HexColor('#111827'),
-                    spaceAfter=30,
-                )
-                story.append(Paragraph("VMRC Export Report", title_style))
-                story.append(Spacer(1, 0.2*inch))
-                
-                # Date/Time
-                story.append(Paragraph(f"<b>Export Date:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
-                story.append(Spacer(1, 0.3*inch))
-                
-                # Raster Info
-                story.append(Paragraph("<b>Raster Information</b>", styles['Heading2']))
-                raster_table_data = [
-                    ["Raster Name:", raster_name],
-                ]
-                raster_table = Table(raster_table_data, colWidths=[2*inch, 4.5*inch])
-                raster_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f9fafb')),
-                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#111827')),
-                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, -1), 10),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-                    ('TOPPADDING', (0, 0), (-1, -1), 6),
-                    ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
-                ]))
-                story.append(raster_table)
-                story.append(Spacer(1, 0.3*inch))
-                
-                # Filter Selections (Context)
-                if req.context:
-                    story.append(Paragraph("<b>Filter Selections</b>", styles['Heading2']))
-                    context_data = []
-                    if req.context.get("mapType"):
-                        context_data.append(["Map Type:", expand_map_type(req.context.get("mapType"))])
-                    if req.context.get("species"):
-                        context_data.append(["Species:", str(req.context.get("species"))])
-                    if req.context.get("condition"):
-                        context_data.append(["Condition:", expand_condition(req.context.get("condition"))])
-                    if req.context.get("month"):
-                        context_data.append(["Month:", str(req.context.get("month"))])
-                    if req.context.get("coverPercent"):
-                        context_data.append(["Cover %:", str(req.context.get("coverPercent"))])
-                    if req.context.get("stressLevel"):
-                        context_data.append(["Stress Level:", str(req.context.get("stressLevel"))])
-                    if req.context.get("hslClass"):
-                        context_data.append(["HSL Class:", str(req.context.get("hslClass"))])
+                if overlay_url:
+                    overlay_filename = Path(overlay_url).name
+                    overlay_path = Path("static/overlays") / overlay_filename
                     
-                    if context_data:
-                        context_table = Table(context_data, colWidths=[2*inch, 4.5*inch])
-                        context_table.setStyle(TableStyle([
-                            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f9fafb')),
-                            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#111827')),
-                            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-                            ('FONTSIZE', (0, 0), (-1, -1), 10),
-                            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-                            ('TOPPADDING', (0, 0), (-1, -1), 6),
-                            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
-                        ]))
-                        story.append(context_table)
-                        story.append(Spacer(1, 0.3*inch))
-                
-                # AOI Summary
-                story.append(Paragraph("<b>AOI Summary</b>", styles['Heading2']))
-                aoi_data = [
-                    ["Bounds (West):", f"{bounds.get('west', 0):.6f}"],
-                    ["Bounds (South):", f"{bounds.get('south', 0):.6f}"],
-                    ["Bounds (East):", f"{bounds.get('east', 0):.6f}"],
-                    ["Bounds (North):", f"{bounds.get('north', 0):.6f}"],
-                ]
-                # Normalize GeoJSON to single Feature before parsing geometry
-                try:
-                    export_feature = normalize_for_export(req.user_clip_geojson)
-                    geom_dict = export_feature.get("geometry")
-                    if not geom_dict:
-                        raise ValueError("Normalized feature has no geometry")
-                    geom = shape(geom_dict)
-                except Exception as norm_err:
-                    print(f"[EXPORT] PDF: Failed to normalize GeoJSON: {norm_err}")
-                    # Fallback: try to extract geometry directly (may fail for FeatureCollection)
-                    if "geometry" in req.user_clip_geojson:
-                        geom = shape(req.user_clip_geojson["geometry"])
-                    elif req.user_clip_geojson.get("type") == "Feature":
-                        geom = shape(req.user_clip_geojson.get("geometry", req.user_clip_geojson))
+                    if overlay_path.exists():
+                        # Load PNG bytes from local file
+                        print(f"[EXPORT] Loading PNG overlay from: {overlay_path}")
+                        try:
+                            with open(overlay_path, "rb") as f:
+                                png_bytes = f.read()
+                            print(f"[EXPORT] ✓ Loaded PNG overlay ({len(png_bytes)} bytes)")
+                        except Exception as load_err:
+                            print(f"[EXPORT] Warning: Failed to load PNG file: {load_err}")
+                            png_bytes = None
                     else:
-                        raise ValueError(f"Cannot parse geometry from GeoJSON: {norm_err}")
-                
-                if hasattr(geom, 'area'):
-                    aoi_data.append(["Approximate Area (deg²):", f"{geom.area:.8f}"])
-                if hasattr(geom, 'exterior') and hasattr(geom.exterior, 'coords'):
-                    vertex_count = len(geom.exterior.coords)
-                    aoi_data.append(["Vertex Count:", str(vertex_count)])
-                elif hasattr(geom, 'boundary') and hasattr(geom.boundary, 'coords'):
-                    # For MultiPolygon or other complex geometries
-                    try:
-                        vertex_count = sum(len(part.exterior.coords) for part in geom.geoms if hasattr(part, 'exterior'))
-                        if vertex_count > 0:
-                            aoi_data.append(["Vertex Count (approx):", str(vertex_count)])
-                    except:
-                        pass
-                
-                aoi_table = Table(aoi_data, colWidths=[2*inch, 4.5*inch])
-                aoi_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f9fafb')),
-                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#111827')),
-                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, -1), 10),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-                    ('TOPPADDING', (0, 0), (-1, -1), 6),
-                    ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
-                ]))
-                story.append(aoi_table)
-                story.append(Spacer(1, 0.3*inch))
-                
-                # Statistics
-                story.append(Paragraph("<b>Statistics</b>", styles['Heading2']))
-                
-                # Calculate median and percentiles
-                median = None
-                percentiles_dict = {}
-                if len(valid_pixels) > 0:
-                    sorted_pixels = np.sort(valid_pixels)
-                    median = float(np.median(sorted_pixels))
-                    for p in [10, 25, 50, 75, 90]:
-                        idx = max(0, min(len(sorted_pixels) - 1, int((p / 100) * (len(sorted_pixels) - 1))))
-                        percentiles_dict[p] = float(sorted_pixels[idx])
-                
-                stats_data = [
-                    ["Count:", str(stats.get("count", len(valid_pixels)))],
-                    ["Min:", f"{stats.get('min', 0):.2f}"],
-                    ["Max:", f"{stats.get('max', 0):.2f}"],
-                    ["Mean:", f"{stats.get('mean', 0):.2f}"],
-                    ["Median:", f"{median:.2f}" if median is not None else "N/A"],
-                    ["Std Dev:", f"{stats.get('std', 0):.2f}"],
-                ]
-                
-                # Add percentiles if available
-                if percentiles_dict:
-                    for p in [10, 25, 50, 75, 90]:
-                        val = percentiles_dict.get(p, 0)
-                        stats_data.append([f"{p}th Percentile:", f"{val:.2f}"])
-                
-                stats_table = Table(stats_data, colWidths=[2*inch, 4.5*inch])
-                stats_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f9fafb')),
-                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#111827')),
-                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, -1), 10),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-                    ('TOPPADDING', (0, 0), (-1, -1), 6),
-                    ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
-                ]))
-                story.append(stats_table)
-                story.append(Spacer(1, 0.3*inch))
-                
-                # Histogram bin table
-                story.append(Paragraph("<b>Histogram Bins</b>", styles['Heading2']))
-                bin_counts = np.zeros(10, dtype=int)
-                if len(valid_pixels) > 0:
-                    for v in valid_pixels:
-                        clamped = max(0, min(100, v))
-                        idx = 9 if clamped == 100 else max(0, min(9, int(np.floor(clamped / 10))))
-                        bin_counts[idx] += 1
-                
-                total_count = bin_counts.sum() or 1
-                histogram_data = [["Range", "Count", "Percentage"]]
-                bin_ranges = get_histogram_bin_ranges()
-                
-                for range_label, count in zip(bin_ranges, bin_counts):
-                    percentage = (count / total_count) * 100 if total_count > 0 else 0
-                    histogram_data.append([range_label, str(count), f"{percentage:.2f}%"])
-                
-                histogram_table = Table(histogram_data, colWidths=[1.5*inch, 1.5*inch, 1.5*inch])
-                histogram_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#374151')),
-                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, -1), 9),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-                    ('TOPPADDING', (0, 0), (-1, -1), 6),
-                    ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
-                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
-                ]))
-                story.append(histogram_table)
-                story.append(Spacer(1, 0.3*inch))
-                
-                # Preview image (if PNG overlay exists from clip)
-                story.append(PageBreak())
-                story.append(Paragraph("<b>Preview Image</b>", styles['Heading2']))
-                story.append(Spacer(1, 0.2*inch))
-                
-                try:
-                    overlay_url = clip_result.get("overlay_url", "")
-                    if overlay_url:
-                        # Try to fetch image as base64 data URL
-                        # First try local file path
-                        overlay_filename = Path(overlay_url).name
-                        overlay_path = Path("static/overlays") / overlay_filename
-                        
-                        if overlay_path.exists():
-                            # Use local file
-                            print(f"[EXPORT] Using local overlay file: {overlay_path}")
+                        # Try fetching from URL
+                        print(f"[EXPORT] Local file not found, fetching from URL: {overlay_url}")
+                        if HAS_REQUESTS:
                             try:
-                                # Resize image to fit page width (6.5 inches max, maintain aspect)
-                                img = Image(str(overlay_path), width=6.5*inch, height=6.5*inch, kind='proportional')
-                                # Wrap image in a table to add border
-                                img_table = Table([[img]], colWidths=[6.5*inch])
-                                img_table.setStyle(TableStyle([
-                                    ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#d1d5db')),  # Light gray border
-                                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                                ]))
-                                story.append(img_table)
-                                print(f"[EXPORT] ✓ Preview image embedded from local file")
-                            except Exception as local_err:
-                                print(f"[EXPORT] Warning: Failed to load local image: {local_err}")
-                                # Fallback: try fetching as URL
-                                data_url = fetch_image_as_base64(overlay_url)
-                                if data_url:
-                                    img = Image(data_url, width=6.5*inch, height=6.5*inch, kind='proportional')
-                                    # Wrap image in a table to add border
-                                    img_table = Table([[img]], colWidths=[6.5*inch])
-                                    img_table.setStyle(TableStyle([
-                                        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#d1d5db')),  # Light gray border
-                                        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                                    ]))
-                                    story.append(img_table)
-                                    print(f"[EXPORT] ✓ Preview image embedded from URL")
+                                base_url = "http://127.0.0.1:8000"
+                                if overlay_url.startswith("/"):
+                                    full_url = f"{base_url}{overlay_url}"
                                 else:
-                                    story.append(Paragraph("No preview available", styles['Normal']))
-                        else:
-                            # Try fetching as URL
-                            print(f"[EXPORT] Local file not found, fetching from URL: {overlay_url}")
-                            data_url = fetch_image_as_base64(overlay_url)
-                            if data_url:
-                                img = Image(data_url, width=6.5*inch, height=6.5*inch, kind='proportional')
-                                # Wrap image in a table to add border
-                                img_table = Table([[img]], colWidths=[6.5*inch])
-                                img_table.setStyle(TableStyle([
-                                    ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#d1d5db')),  # Light gray border
-                                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                                ]))
-                                story.append(img_table)
-                                print(f"[EXPORT] ✓ Preview image embedded from URL")
-                            else:
-                                story.append(Paragraph("No preview available", styles['Normal']))
-                    else:
-                        story.append(Paragraph("No preview available", styles['Normal']))
-                except Exception as img_err:
-                    import traceback
-                    print(f"[EXPORT] Warning: Could not embed preview image: {img_err}")
-                    traceback.print_exc()
-                    story.append(Paragraph("No preview available", styles['Normal']))
+                                    full_url = f"{base_url}/{overlay_url}"
+                                
+                                response = requests.get(full_url, timeout=10)
+                                response.raise_for_status()
+                                png_bytes = response.content
+                                print(f"[EXPORT] ✓ Fetched PNG overlay from URL ({len(png_bytes)} bytes)")
+                            except Exception as fetch_err:
+                                print(f"[EXPORT] Warning: Failed to fetch PNG from URL: {fetch_err}")
+                                png_bytes = None
                 
-                # Build PDF
-                print(f"[EXPORT] Building PDF document...")
-                doc.build(story)
-                print(f"[EXPORT] ✓ PDF exported successfully: {pdf_path}")
+                # If PNG still not available, generate it now
+                if not png_bytes:
+                    print(f"[EXPORT] PNG overlay not found, generating new preview...")
+                    try:
+                        png_bytes = render_clipped_preview_png(
+                            raster_layer_id=req.raster_layer_id,
+                            user_clip_geojson=req.user_clip_geojson
+                        )
+                        print(f"[EXPORT] ✓ Generated PNG preview ({len(png_bytes)} bytes)")
+                    except Exception as gen_err:
+                        error_msg = f"Failed to generate PNG preview: {str(gen_err)}"
+                        print(f"[EXPORT] ERROR: {error_msg}")
+                        import traceback
+                        traceback.print_exc()
+                        # Continue without image - will show "Preview image unavailable" in PDF
+                
+                # ============================================================
+                # BUILD PDF REPORT WITH RASTER PREVIEW
+                # ============================================================
+                # Build title with dataset name and AOI name
+                title_text = "VMRC Export Report"
+                if req.context:
+                    dataset_parts = []
+                    if req.context.get("mapType"):
+                        dataset_parts.append(expand_map_type(req.context.get("mapType")))
+                    if req.context.get("species"):
+                        dataset_parts.append(req.context.get("species"))
+                    if req.context.get("condition"):
+                        dataset_parts.append(expand_condition(req.context.get("condition")))
+                    if req.context.get("month"):
+                        dataset_parts.append(f"Month {req.context.get('month')}")
+                    if req.context.get("coverPercent"):
+                        dataset_parts.append(f"Cover {req.context.get('coverPercent')}%")
+                    if req.context.get("hslClass"):
+                        dataset_parts.append(f"HSL Class {req.context.get('hslClass')}")
+                    
+                    if dataset_parts:
+                        title_text = " · ".join(dataset_parts)
+                
+                # Calculate median if not in stats
+                median = None
+                if len(valid_pixels) > 0:
+                    median = float(np.median(valid_pixels))
+                elif stats.get("median") is not None:
+                    median = stats.get("median")
+                
+                # Prepare stats dict for PDF helper
+                pdf_stats = {
+                    "min": stats.get("min", 0),
+                    "max": stats.get("max", 0),
+                    "mean": stats.get("mean", 0),
+                    "median": median,
+                    "std": stats.get("std", 0),
+                    "count": stats.get("count", len(valid_pixels) if len(valid_pixels) > 0 else 0),
+                }
+                
+                # Get histogram from clip_result for expanded stats
+                histogram = clip_result.get("histogram")
+                
+                # Compute expanded statistics (Area by Threshold, Most Common Range)
+                expanded_stats = compute_expanded_stats(
+                    stats=pdf_stats,
+                    histogram=histogram,
+                    valid_pixels=valid_pixels if len(valid_pixels) > 0 else None
+                )
+                
+                # Merge expanded stats into pdf_stats
+                pdf_stats.update(expanded_stats)
+                
+                # Legend bins (matching colormap)
+                legend_bins = [
+                    {"range": "0–10", "color": "#006400", "label": "0–10"},
+                    {"range": "10–20", "color": "#228B22", "label": "10–20"},
+                    {"range": "20–30", "color": "#9ACD32", "label": "20–30"},
+                    {"range": "30–40", "color": "#FFD700", "label": "30–40"},
+                    {"range": "40–50", "color": "#FFA500", "label": "40–50"},
+                    {"range": "50–60", "color": "#FF8C00", "label": "50–60"},
+                    {"range": "60–70", "color": "#FF6B00", "label": "60–70"},
+                    {"range": "70–80", "color": "#FF4500", "label": "70–80"},
+                    {"range": "80–90", "color": "#DC143C", "label": "80–90"},
+                    {"range": "90–100", "color": "#B22222", "label": "90–100"},
+                ]
+                
+                # Always generate PDF (with or without image)
+                pdf_bytes = build_pdf_report(
+                    title=title_text,
+                    png_bytes=png_bytes,  # May be None if generation failed
+                    stats=pdf_stats,
+                    legend_bins=legend_bins,
+                    aoi_name=req.aoi_name,
+                    raster_name=raster_name,
+                    context=req.context
+                )
+                    
+                # Write PDF bytes to file
+                with open(pdf_path, "wb") as f:
+                    f.write(pdf_bytes)
+                
+                if png_bytes:
+                    print(f"[EXPORT] ✓ PDF exported successfully with raster preview: {pdf_path}")
+                else:
+                    print(f"[EXPORT] ✓ PDF exported successfully (text-only, image unavailable): {pdf_path}")
+                
                 output_files["pdf"] = f"/static/exports/{export_id}/{pdf_name}"
                 
             except Exception as e:
@@ -1381,3 +2329,261 @@ def export_raster(req: ExportRequest):
         response["errors"] = errors
     
     return response
+
+
+# ============================================================
+# DEDICATED PDF EXPORT ENDPOINT
+# ============================================================
+@router.post("/export/pdf", summary="Generate PDF report with raster map and statistics")
+async def export_pdf_report(req: PDFExportRequest):
+    """
+    Generate a professional PDF report with:
+    - Clipped raster map visualization (same colors as UI)
+    - Statistics summary (exactly matching UI values)
+    - Auto-generated filename based on dataset selection
+    - Clean, professional report-style layout (landscape orientation)
+    
+    This endpoint reuses the same PNG overlay and statistics from clip_raster_for_layer()
+    to ensure PDF matches the web UI exactly.
+    """
+    if not HAS_REPORTLAB:
+        raise HTTPException(
+            status_code=503,
+            detail="PDF export requires reportlab. Install with: pip install reportlab"
+        )
+    
+    try:
+        print(f"\n[PDF EXPORT] Starting PDF generation...")
+        print(f"[PDF EXPORT] Raster layer ID: {req.raster_layer_id}")
+        print(f"[PDF EXPORT] AOI name: {req.aoi_name}")
+        print(f"[PDF EXPORT] Context: {req.context}")
+        
+        # ============================================================
+        # STEP 1: Get PNG overlay and stats (reuse existing logic)
+        # ============================================================
+        png_bytes = None
+        stats = None
+        bounds = None
+        raster_crs = None
+        raster_name = None
+        
+        if req.overlay_url and req.stats:
+            # Use provided overlay and stats (from frontend createdRasters)
+            print(f"[PDF EXPORT] Using provided overlay_url and stats")
+            overlay_filename = Path(req.overlay_url).name
+            overlay_path = Path("static/overlays") / overlay_filename
+            
+            if overlay_path.exists():
+                with open(overlay_path, "rb") as f:
+                    png_bytes = f.read()
+                stats = req.stats
+                print(f"[PDF EXPORT] ✓ Loaded PNG overlay ({len(png_bytes)} bytes)")
+                print(f"[PDF EXPORT] ✓ Using provided stats: {stats}")
+            else:
+                print(f"[PDF EXPORT] Warning: Overlay file not found, will re-clip")
+        
+        if not png_bytes or not stats:
+            # Re-clip raster to get PNG overlay and stats
+            print(f"[PDF EXPORT] Clipping raster to generate PNG overlay and stats...")
+            from app.services.raster_service import clip_raster_for_layer
+            
+            clip_result = clip_raster_for_layer(
+                raster_layer_id=req.raster_layer_id,
+                user_clip_geojson=req.user_clip_geojson,
+                zoom=None  # Use native resolution for PDF (no zoom-based resampling)
+            )
+            
+            # Extract PNG overlay
+            overlay_url = clip_result.get("overlay_url", "")
+            if overlay_url:
+                overlay_filename = Path(overlay_url).name
+                overlay_path = Path("static/overlays") / overlay_filename
+                if overlay_path.exists():
+                    with open(overlay_path, "rb") as f:
+                        png_bytes = f.read()
+                    print(f"[PDF EXPORT] ✓ Generated PNG overlay ({len(png_bytes)} bytes)")
+            
+            # Extract stats (exactly as computed for UI)
+            stats = clip_result.get("stats", {})
+            bounds = clip_result.get("bounds", {})
+            print(f"[PDF EXPORT] ✓ Extracted stats: {stats}")
+        
+        if not png_bytes:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to generate or load PNG overlay for PDF"
+            )
+        
+        if not stats:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to compute statistics for PDF"
+            )
+        
+        # Get raster info for footer
+        try:
+            from app.services.raster_service import resolve_raster_path
+            from app.services.raster_index import RASTER_LOOKUP_LIST
+            
+            raster_path = resolve_raster_path(req.raster_layer_id)
+            raster_item = next((r for r in RASTER_LOOKUP_LIST if r["id"] == req.raster_layer_id), None)
+            raster_name = raster_item.get("name", "Unknown") if raster_item else "Unknown"
+            
+            # Get CRS from raster file
+            with rasterio.open(raster_path) as src:
+                raster_crs = src.crs
+        except Exception as e:
+            print(f"[PDF EXPORT] Warning: Could not get raster info: {e}")
+            raster_crs = None
+            raster_name = "Unknown"
+        
+        # ============================================================
+        # STEP 2: Generate filename (auto-generate if not provided)
+        # ============================================================
+        if req.filename:
+            pdf_filename = sanitize_filename(req.filename)
+            if not pdf_filename.endswith(".pdf"):
+                pdf_filename += ".pdf"
+        else:
+            # Auto-generate filename from context
+            filename_parts = []
+            context = req.context or {}
+            
+            # Map type
+            if context.get("mapType"):
+                map_type = str(context.get("mapType")).upper()
+                if map_type == "MORTALITY":
+                    filename_parts.append("Mortality")
+                elif map_type == "HSL":
+                    filename_parts.append("HSL")
+                else:
+                    filename_parts.append(map_type)
+            
+            # Species
+            if context.get("species"):
+                species = str(context.get("species"))
+                if species == "Douglas-fir":
+                    filename_parts.append("DF")
+                elif species == "Western Hemlock":
+                    filename_parts.append("WH")
+                else:
+                    filename_parts.append(species.replace(" ", "_")[:10])
+            
+            # Condition
+            if context.get("condition"):
+                condition = str(context.get("condition")).upper()
+                filename_parts.append(condition[0] if condition else "")
+            
+            # Month (for mortality)
+            if context.get("month"):
+                filename_parts.append(str(context.get("month")))
+            
+            # Cover percent
+            if context.get("coverPercent"):
+                filename_parts.append(f"Cover{context.get('coverPercent')}")
+            
+            # HSL class (for HSL maps)
+            if context.get("hslClass"):
+                filename_parts.append(str(context.get("hslClass")))
+            
+            # Join parts
+            if filename_parts:
+                pdf_filename = "_".join(filename_parts) + ".pdf"
+            else:
+                pdf_filename = f"vmrc_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            
+            pdf_filename = sanitize_filename(pdf_filename)
+        
+        print(f"[PDF EXPORT] PDF filename: {pdf_filename}")
+        
+        # ============================================================
+        # STEP 3: Build title from context
+        # ============================================================
+        title_text = "VMRC Export Report"
+        context = req.context or {}
+        if context:
+            dataset_parts = []
+            if context.get("mapType"):
+                dataset_parts.append(expand_map_type(context.get("mapType")))
+            if context.get("species"):
+                dataset_parts.append(context.get("species"))
+            if context.get("condition"):
+                dataset_parts.append(expand_condition(context.get("condition")))
+            if context.get("month"):
+                dataset_parts.append(f"Month {context.get('month')}")
+            if context.get("coverPercent"):
+                dataset_parts.append(f"Cover {context.get('coverPercent')}%")
+            if context.get("hslClass"):
+                dataset_parts.append(f"HSL Class {context.get('hslClass')}")
+            
+            if dataset_parts:
+                title_text = " · ".join(dataset_parts)
+        
+        # ============================================================
+        # STEP 4: Prepare stats for PDF (ensure median is included)
+        # ============================================================
+        pdf_stats = {
+            "min": stats.get("min", 0),
+            "max": stats.get("max", 0),
+            "mean": stats.get("mean", 0),
+            "median": stats.get("median"),  # May be None
+            "std": stats.get("std", 0),
+            "count": stats.get("count", 0),
+        }
+        
+        # Calculate median if not in stats
+        if pdf_stats["median"] is None and pdf_stats["count"] > 0:
+            # Try to get pixel values from clip_result if available
+            # Otherwise, median will be "N/A" in PDF
+            pass
+        
+        # ============================================================
+        # STEP 5: Generate PDF with landscape orientation
+        # ============================================================
+        legend_bins = [
+            {"range": "0–10", "color": "#006400", "label": "0–10"},
+            {"range": "10–20", "color": "#228B22", "label": "10–20"},
+            {"range": "20–30", "color": "#9ACD32", "label": "20–30"},
+            {"range": "30–40", "color": "#FFD700", "label": "30–40"},
+            {"range": "40–50", "color": "#FFA500", "label": "40–50"},
+            {"range": "50–60", "color": "#FF8C00", "label": "50–60"},
+            {"range": "60–70", "color": "#FF6B00", "label": "60–70"},
+            {"range": "70–80", "color": "#FF4500", "label": "70–80"},
+            {"range": "80–90", "color": "#DC143C", "label": "80–90"},
+            {"range": "90–100", "color": "#B22222", "label": "90–100"},
+        ]
+        
+        pdf_bytes = build_pdf_report_landscape(
+            title=title_text,
+            png_bytes=png_bytes,
+            stats=pdf_stats,
+            legend_bins=legend_bins,
+            aoi_name=req.aoi_name,
+            raster_name=raster_name,
+            raster_crs=raster_crs,
+            context=context
+        )
+        
+        print(f"[PDF EXPORT] ✓ Generated PDF ({len(pdf_bytes)} bytes)")
+        
+        # ============================================================
+        # STEP 6: Return PDF as streaming response
+        # ============================================================
+        from fastapi.responses import Response
+        
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{pdf_filename}"'
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        error_msg = f"PDF export failed: {str(e)}"
+        print(f"[PDF EXPORT] ERROR: {error_msg}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=error_msg)

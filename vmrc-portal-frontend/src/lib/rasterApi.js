@@ -1,126 +1,146 @@
 // src/lib/rasterApi.js
 
-// API Base URL from environment variable
-// Defaults to Cloudflare tunnel URL for testing "frontend -> public backend" locally
-// Set VITE_API_BASE_URL in .env file to override
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "https://feel-robin-punch-ping.trycloudflare.com";
+const API_BASE_URL =
+  (import.meta.env.VITE_API_BASE_URL || "").trim() ||
+  "http://127.0.0.1:8000";
 
-// Helper function to build API URLs
-// Ensures proper path joining (handles trailing/leading slashes)
 export function apiUrl(path) {
   const base = API_BASE_URL.endsWith("/") ? API_BASE_URL.slice(0, -1) : API_BASE_URL;
-  const apiPath = path.startsWith("/") ? path : `/${path}`;
-  // Ensure /api/v1 prefix
-  if (!apiPath.startsWith("/api/v1")) {
-    return `${base}/api/v1${apiPath}`;
-  }
-  return `${base}${apiPath}`;
+  const p = path.startsWith("/") ? path : `/${path}`;
+  return `${base}${p}`;
 }
 
 // Export API base for debugging
 export const API_BASE = API_BASE_URL;
 
-// Log API base URL at module load (for debugging)
-console.log("[rasterApi] API Base URL:", API_BASE_URL);
+// Print once on module load
+console.log("[rasterApi] API_BASE_URL =", API_BASE_URL);
 
 /**
  * Get the global AOI GeoJSON from the backend.
  * Backend endpoint: GET /api/v1/aoi
  */
 export async function fetchGlobalAOI() {
-  console.log("[rasterApi] fetchGlobalAOI() called");
-
-  const res = await fetch(apiUrl("/aoi"));
-
+  const res = await fetch(apiUrl("/api/v1/aoi"));
   const text = await res.text();
-  console.log("[rasterApi] /aoi raw response:", text);
 
   if (!res.ok) {
     console.error("[rasterApi] fetchGlobalAOI failed:", res.status, text);
     throw new Error("Failed to load global AOI");
   }
+  return JSON.parse(text);
+}
 
-  const data = JSON.parse(text);
-  console.log("[rasterApi] fetchGlobalAOI parsed JSON:", data);
-  return data;
+/**
+ * Upload custom AOI file.
+ * Backend endpoint: POST /api/v1/aoi/upload
+ */
+export async function uploadAOI(file) {
+  const form = new FormData();
+  form.append("file", file);
+
+  const res = await fetch(apiUrl("/api/v1/aoi/upload"), {
+    method: "POST",
+    body: form,
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    console.error("[rasterApi] uploadAOI failed:", res.status, text);
+    throw new Error(`Upload failed: ${res.status}`);
+  }
+
+  return text ? JSON.parse(text) : {};
 }
 
 /**
  * Clip a raster by the user-drawn polygon (and global AOI on backend).
  * Backend endpoint: POST /api/v1/rasters/clip
+ * 
+ * @param {Object} params
+ * @param {number} params.rasterLayerId - ID of the raster layer to clip
+ * @param {Object} params.userClipGeoJSON - GeoJSON polygon defining the AOI
+ * @param {number} [params.zoom] - Optional Leaflet zoom level for high-res overlay (zoom >= 12)
  */
-export async function clipRaster({ rasterLayerId, userClipGeoJSON }) {
-
-  const res = await fetch(apiUrl("/rasters/clip"), {
+export async function clipRaster({ rasterLayerId, userClipGeoJSON, zoom }) {
+  const res = await fetch(apiUrl("/api/v1/rasters/clip"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       raster_layer_id: rasterLayerId,
       user_clip_geojson: userClipGeoJSON,
+      zoom: zoom,  // Send zoom level for display overlay resampling
     }),
   });
 
-
   const text = await res.text();
-  console.log("[rasterApi] /rasters/clip raw response:", text);
-
   if (!res.ok) {
     console.error("[rasterApi] clipRaster failed:", res.status, text);
-    throw new Error("Clip failed");
+    
+    // Try to parse error detail for friendly messages
+    let errorMessage = "Clip failed";
+    try {
+      const errorData = JSON.parse(text);
+      const detail = errorData?.detail || errorData?.message || text;
+      
+      // Check for specific 422 errors (Unprocessable Entity - validation errors)
+      if (res.status === 422) {
+        if (detail.includes("AOI contains no raster data") || detail.includes("no raster data for this layer")) {
+          errorMessage = "AOI doesn't overlap this raster. Try a different area.";
+        } else if (detail.includes("AOI outside raster extent") || detail.includes("AOI too small") || detail.includes("no intersect")) {
+          errorMessage = "AOI doesn't overlap this raster. Try a different area.";
+        } else {
+          errorMessage = detail;
+        }
+      } else {
+        // For other errors, use the detail if available
+        errorMessage = detail;
+      }
+    } catch (parseErr) {
+      // If JSON parsing fails, use the raw text or default message
+      errorMessage = text || "Clip failed";
+    }
+    
+    // Create error object with status code and message
+    const error = new Error(errorMessage);
+    error.status = res.status;
+    error.detail = errorMessage;
+    throw error;
   }
 
-  const data = JSON.parse(text);
-  console.log("[rasterApi] clipRaster parsed JSON:", data);
-  return data;
+  return text ? JSON.parse(text) : {};
 }
 
 /**
- * Export the clipped raster in one or more formats.
+ * Export raster.
  * Backend endpoint: POST /api/v1/rasters/export
- *
- * formats: array of strings, e.g. ["png", "tif", "csv"]
- * 
- * 
  */
-
-export async function uploadAOI(file) {
-  const form = new FormData();
-  form.append("file", file);
-
-  const res = await fetch(apiUrl("/aoi/upload"), {
-    method: "POST",
-    body: form,
-  });
-
-  if (!res.ok) {
-    throw new Error(`Upload failed: ${res.status}`);
-  }
-
-  return await res.json();
-}
-
-
-export async function exportRaster({ rasterLayerId, userClipGeoJSON, formats, filename, context }) {
-  console.log("[rasterApi] exportRaster() called with:", {
-    rasterLayerId,
-    userClipGeoJSON,
-    formats,
-    filename,
-    context,
-  });
-
+export async function exportRaster({ rasterLayerId, userClipGeoJSON, formats, filename, context, overlayUrl, aoiName, overlayUrls }) {
   let res;
   try {
-    res = await fetch(apiUrl("/rasters/export"), {
+    const body = {
+      raster_layer_id: rasterLayerId,
+      user_clip_geojson: userClipGeoJSON,
+      formats: formats || [],
+      filename: filename || null,
+      context: context || {},
+    };
+    
+    // Add optional fields if provided
+    if (overlayUrl) {
+      body.overlay_url = overlayUrl;
+    }
+    if (aoiName) {
+      body.aoi_name = aoiName;
+    }
+    if (overlayUrls && Array.isArray(overlayUrls) && overlayUrls.length > 0) {
+      body.overlay_urls = overlayUrls;
+    }
+    
+    res = await fetch(apiUrl("/api/v1/rasters/export"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        raster_layer_id: rasterLayerId,
-        user_clip_geojson: userClipGeoJSON,
-        formats: formats || [],
-        filename: filename || null,
-        context: context || {},
-      }),
+      body: JSON.stringify(body),
     });
   } catch (err) {
     console.error("[rasterApi] network error in exportRaster:", err);
@@ -128,62 +148,25 @@ export async function exportRaster({ rasterLayerId, userClipGeoJSON, formats, fi
   }
 
   const text = await res.text();
-  console.log("[rasterApi] /rasters/export raw response:", text);
-
   if (!res.ok) {
-    // Try to surface backend message if present
     try {
       const data = JSON.parse(text);
       const detail = data?.detail || JSON.stringify(data);
-      console.error("[rasterApi] exportRaster failed:", res.status, detail);
       throw new Error(`Export failed (${res.status}): ${detail}`);
     } catch {
-      console.error("[rasterApi] exportRaster failed:", res.status, text);
       throw new Error(`Export failed (${res.status})`);
     }
   }
 
-  const data = text ? JSON.parse(text) : {};
-  console.log("[rasterApi] exportRaster parsed JSON:", data);
-  return data;
+  return text ? JSON.parse(text) : {};
 }
 
 /**
- * Get raster value at a specific lat/lon for the given layer.
- * Backend endpoint: POST /api/v1/rasters/value
+ * Sample value.
+ * Backend endpoint: POST /api/v1/rasters/sample
  */
-export async function getRasterValueAt({ rasterLayerId, lat, lon }) {
-  console.log("[rasterApi] getRasterValueAt():", {
-    rasterLayerId,
-    lat,
-    lon,
-  });
-
-  const res = await fetch(apiUrl("/rasters/value"), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      raster_layer_id: rasterLayerId,
-      lat,
-      lon,
-    }),
-  });
-
-  const text = await res.text();
-  console.log("[rasterApi] /rasters/value raw response:", text);
-
-  if (!res.ok) {
-    console.error("[rasterApi] getRasterValueAt failed:", res.status, text);
-    throw new Error("Failed to get value at point");
-  }
-
-  const data = text ? JSON.parse(text) : {};
-  console.log("[rasterApi] getRasterValueAt parsed JSON:", data);
-  return data;
-}
-
 export async function sampleRasterValue({ rasterLayerId, lat, lng }) {
-  const res = await fetch(apiUrl("/rasters/sample"), {
+  const res = await fetch(apiUrl("/api/v1/rasters/sample"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -193,81 +176,34 @@ export async function sampleRasterValue({ rasterLayerId, lat, lng }) {
     }),
   });
 
+  const text = await res.text();
   if (!res.ok) {
+    console.error("[rasterApi] sampleRasterValue failed:", res.status, text);
     throw new Error("Failed to sample raster value");
   }
 
-  return res.json();
+  return text ? JSON.parse(text) : {};
 }
 
 /**
- * Export a georeferenced PDF (GeoPDF) for Avenza Maps.
- * Backend endpoint: POST /api/v1/export/geopdf
+ * Get raster value at a specific lat/lon.
+ * Backend endpoint: GET /api/v1/rasters/value?layer_id=<id>&lat=<lat>&lon=<lon>
  */
-export async function exportGeoPDFNew({ rasterId, aoiGeoJSON, title, author }) {
-  console.log("[rasterApi] exportGeoPDFNew() called with:", {
-    rasterId,
-    aoiGeoJSON,
-    title,
-    author,
+export async function getRasterValueAt({ rasterLayerId, lat, lon }) {
+  // Use GET with query parameters for better caching and simpler API
+  const url = apiUrl(`/api/v1/rasters/value?layer_id=${rasterLayerId}&lat=${lat}&lon=${lon}`);
+  const res = await fetch(url, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
   });
 
-  let res;
-  try {
-    res = await fetch(apiUrl("/export/geopdf"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        raster_id: rasterId,
-        aoi_geojson: aoiGeoJSON || null,
-        title: title || null,
-        author: author || null,
-      }),
-    });
-  } catch (err) {
-    console.error("[rasterApi] network error in exportGeoPDFNew:", err);
-    throw new Error("Network error while exporting GeoPDF (backend not reachable?)");
-  }
-
+  const text = await res.text();
   if (!res.ok) {
-    const text = await res.text();
-    try {
-      const data = JSON.parse(text);
-      const detail = data?.detail || JSON.stringify(data);
-      console.error("[rasterApi] exportGeoPDFNew failed:", res.status, detail);
-      throw new Error(`GeoPDF export failed (${res.status}): ${detail}`);
-    } catch {
-      console.error("[rasterApi] exportGeoPDFNew failed:", res.status, text);
-      throw new Error(`GeoPDF export failed (${res.status})`);
-    }
+    console.error("[rasterApi] getRasterValueAt failed:", res.status, text);
+    throw new Error("Failed to get value at point");
   }
 
-  // Response is a PDF file, download it
-  const blob = await res.blob();
-  const url = window.URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = res.headers.get("Content-Disposition")?.split("filename=")[1]?.replace(/"/g, "") || "export.pdf";
-  document.body.appendChild(a);
-  a.click();
-  window.URL.revokeObjectURL(url);
-  document.body.removeChild(a);
-  
-  console.log("[rasterApi] ✓ GeoPDF downloaded");
-  return { success: true };
-}
-
-/**
- * Legacy exportGeoPDF function (kept for backward compatibility)
- */
-export async function exportGeoPDF({ rasterLayerId, userClipGeoJSON, title, dpi = 200 }) {
-  // Map to new API
-  return exportGeoPDFNew({
-    rasterId: rasterLayerId,
-    aoiGeoJSON: userClipGeoJSON,
-    title,
-    author: null,
-  });
+  return text ? JSON.parse(text) : {};
 }
 
 /**
@@ -279,91 +215,11 @@ export async function downloadGeoPDF(downloadUrl) {
 }
 
 /**
- * Import a GeoPDF file and get overlay preview.
- * Backend endpoint: POST /api/v1/import/geopdf
- */
-export async function importGeoPDF(file) {
-  console.log("[rasterApi] importGeoPDF() called with:", { file });
-
-  const formData = new FormData();
-  formData.append("file", file);
-
-  const res = await fetch(apiUrl("/import/geopdf"), {
-    method: "POST",
-    body: formData,
-  });
-
-  const text = await res.text();
-  console.log("[rasterApi] /import/geopdf raw response:", text);
-
-  if (!res.ok) {
-    try {
-      const data = JSON.parse(text);
-      const detail = data?.detail || JSON.stringify(data);
-      console.error("[rasterApi] importGeoPDF failed:", res.status, detail);
-      throw new Error(`GeoPDF import failed (${res.status}): ${detail}`);
-    } catch {
-      console.error("[rasterApi] importGeoPDF failed:", res.status, text);
-      throw new Error(`GeoPDF import failed (${res.status})`);
-    }
-  }
-
-  const data = text ? JSON.parse(text) : {};
-  console.log("[rasterApi] importGeoPDF parsed JSON:", data);
-  return data;
-}
-
-/**
- * Legacy uploadGeoPDF function (kept for backward compatibility)
- */
-export async function uploadGeoPDF(file, name = null) {
-  return importGeoPDF(file);
-}
-
-/**
- * List all datasets (including uploaded GeoPDFs).
- * Backend endpoint: GET /api/v1/datasets
- */
-export async function listDatasets() {
-  const res = await fetch(apiUrl("/datasets"));
-
-  if (!res.ok) {
-    throw new Error(`Failed to list datasets: ${res.status}`);
-  }
-
-  return res.json();
-}
-
-/**
- * Download a dataset.
- * Backend endpoint: GET /api/v1/datasets/{id}/download
- */
-export async function downloadDataset(datasetId) {
-  const downloadUrl = apiUrl(`/datasets/${datasetId}/download`);
-  window.open(downloadUrl, "_blank");
-}
-
-/**
- * Get dataset preview URL.
- * Backend endpoint: GET /api/v1/datasets/{id}/preview
- */
-export async function getDatasetPreview(datasetId) {
-  const res = await fetch(apiUrl(`/datasets/${datasetId}/preview`));
-
-  if (!res.ok) {
-    return null;
-  }
-
-  const data = await res.json();
-  return data.preview_url;
-}
-
-/**
  * Delete a GeoPDF dataset.
- * Backend endpoint: DELETE /api/v1/geopdf/{id}
+ * Backend endpoint: DELETE /api/v1/geopdf/{datasetId}
  */
 export async function deleteGeoPDF(datasetId) {
-  const res = await fetch(apiUrl(`/geopdf/${datasetId}`), {
+  const res = await fetch(apiUrl(`/api/v1/geopdf/${datasetId}`), {
     method: "DELETE",
   });
 
@@ -380,4 +236,145 @@ export async function deleteGeoPDF(datasetId) {
   }
 
   return text ? JSON.parse(text) : {};
+}
+
+
+/**
+ * List all datasets (including uploaded GeoPDFs).
+ * Backend endpoint: GET /api/v1/datasets
+ */
+export async function listDatasets() {
+  const res = await fetch(apiUrl("/api/v1/datasets"));
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Failed to list datasets: ${res.status}`);
+  return text ? JSON.parse(text) : {};
+}
+
+/**
+ * Download a dataset file.
+ * Backend endpoint: GET /api/v1/datasets/{datasetId}/download
+ */
+export function downloadDataset(datasetId) {
+  const url = apiUrl(`/api/v1/datasets/${datasetId}/download`);
+  window.open(url, "_blank");
+}
+
+/**
+ * Get dataset preview URL.
+ * Backend endpoint: GET /api/v1/datasets/{datasetId}/preview
+ */
+export async function getDatasetPreview(datasetId) {
+  const res = await fetch(apiUrl(`/api/v1/datasets/${datasetId}/preview`));
+  if (!res.ok) return null;
+
+  const data = await res.json();
+  return data.preview_url || null;
+}
+
+/**
+ * Fetch metadata for a layer (uploaded GeoPDF or processed layer).
+ * Backend endpoint: GET /api/v1/layers/{layer_id}/metadata
+ */
+export async function fetchLayerMetadata(layerId) {
+  const res = await fetch(apiUrl(`/api/v1/layers/${layerId}/metadata`));
+  const text = await res.text();
+
+  if (!res.ok) {
+    console.error("[rasterApi] fetchLayerMetadata failed:", res.status, text);
+    throw new Error(`Failed to fetch layer metadata: ${res.status}`);
+  }
+
+  return text ? JSON.parse(text) : {};
+}
+
+/**
+ * Fetch metadata for a raster layer.
+ * Backend endpoint: GET /api/v1/rasters/{raster_id}/metadata
+ */
+export async function fetchRasterMetadata(rasterId) {
+  const res = await fetch(apiUrl(`/api/v1/rasters/${rasterId}/metadata`));
+  const text = await res.text();
+
+  if (!res.ok) {
+    console.error("[rasterApi] fetchRasterMetadata failed:", res.status, text);
+    throw new Error(`Failed to fetch raster metadata: ${res.status}`);
+  }
+
+  return text ? JSON.parse(text) : {};
+}
+
+/**
+ * Get GeoPDF status (diagnostic endpoint to check GDAL availability).
+ * Backend endpoint: GET /api/v1/geopdf/status
+ */
+export async function getGeopdfStatus() {
+  const res = await fetch(apiUrl("/api/v1/geopdf/status"));
+  const text = await res.text();
+
+  if (!res.ok) {
+    console.error("[rasterApi] getGeopdfStatus failed:", res.status, text);
+    throw new Error(`Failed to get GeoPDF status: ${res.status}`);
+  }
+
+  return text ? JSON.parse(text) : {};
+}
+
+/**
+ * Delete an overlay PNG file from the server.
+ * Backend endpoint: DELETE /api/v1/rasters/overlays/{overlay_filename}
+ * 
+ * @param {string} overlayUrl - The overlay URL (e.g., "/static/overlays/abc123.png")
+ * @returns {Promise<{success: boolean, message: string}>}
+ */
+export async function deleteOverlay(overlayUrl) {
+  // Extract filename from URL (e.g., "/static/overlays/abc123.png" -> "abc123.png")
+  const filename = overlayUrl.split("/").pop();
+  
+  if (!filename) {
+    throw new Error("Invalid overlay URL: cannot extract filename");
+  }
+  
+  const res = await fetch(apiUrl(`/api/v1/rasters/overlays/${filename}`), {
+    method: "DELETE",
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    console.error("[rasterApi] deleteOverlay failed:", res.status, text);
+    try {
+      const data = JSON.parse(text);
+      const detail = data?.detail || JSON.stringify(data);
+      throw new Error(`Delete failed (${res.status}): ${detail}`);
+    } catch {
+      throw new Error(`Delete failed (${res.status})`);
+    }
+  }
+
+  return text ? JSON.parse(text) : {};
+}
+
+/**
+ * Download a blob file without navigation (read-only operation).
+ * Uses fetch -> blob -> objectURL and programmatic <a download> click.
+ * 
+ * @param {string} url - URL to download
+ * @param {string} filename - Filename for the download
+ */
+export async function downloadBlob(url, filename) {
+  console.log("[rasterApi] Downloading blob:", url);
+  // CRITICAL: Use credentials: "omit" for static file downloads to avoid CORS issues
+  // Static exports don't need cookies/credentials
+  const res = await fetch(url, { credentials: "omit" });
+  if (!res.ok) throw new Error(`Download failed: ${res.status}`);
+  const blob = await res.blob();
+
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(objectUrl);
+  console.log("[rasterApi] Blob downloaded successfully:", filename);
 }
