@@ -1646,21 +1646,30 @@ def export_raster(req: ExportRequest):
     if req.overlay_url:
         # Use existing PNG overlay - get stats from context if available
         print(f"[EXPORT] Using provided overlay_url: {req.overlay_url}")
-        # Get stats from context if provided (frontend should pass stats from createdRasters)
+        # Get stats, histogram, and bounds from context if provided (frontend should pass stats from createdRasters)
         stats_from_context = {}
+        histogram_from_context = None
         bounds_from_context = {}
+        pixel_values_from_context = []
         if req.context:
             if "stats" in req.context:
                 stats_from_context = req.context["stats"]
+            if "histogram" in req.context:
+                histogram_from_context = req.context["histogram"]
             if "bounds" in req.context:
                 bounds_from_context = req.context["bounds"]
+            if "pixelValues" in req.context:
+                pixel_values_from_context = req.context["pixelValues"]
         
         clip_result = {
             "overlay_url": req.overlay_url,
             "stats": stats_from_context,
+            "histogram": histogram_from_context,
             "bounds": bounds_from_context,
+            "pixels": pixel_values_from_context,
         }
         print(f"[EXPORT] Using stats from context: {stats_from_context}")
+        print(f"[EXPORT] Using histogram from context: {histogram_from_context is not None}")
     else:
         # Perform clip (same as map overlay process)
         try:

@@ -1,0 +1,152 @@
+{
+  "export_date": "2026-01-14T18:08:22.027863",
+  "export_id": "e94163a4",
+  "software": "VMRC Portal",
+  "raster": {
+    "name": "HSL2.5_DF_50_D_l.tif",
+    "path": "D:\\VMRC_Project\\Data_Analysis!!\\Nov20\\HighStressMortality\\Douglas_Fir\\50\\l\\HSL2.5_DF_50_D_l.tif"
+  },
+  "context": {
+    "mapType": "hsl",
+    "species": "Douglas-fir",
+    "month": "04",
+    "condition": "Dry",
+    "dfStress": "Low Stress",
+    "coverPercent": "50",
+    "hslCondition": "D",
+    "hslClass": "l",
+    "stats": {
+      "min": 0.12864665687084198,
+      "max": 99.61978912353516,
+      "mean": 80.24754864682811,
+      "std": 24.07857101051207,
+      "count": 5051
+    },
+    "histogram": {
+      "bins": [
+        0,
+        10,
+        20,
+        30,
+        40,
+        50,
+        60,
+        70,
+        80,
+        90,
+        100
+      ],
+      "counts": [
+        45,
+        133,
+        150,
+        141,
+        231,
+        266,
+        364,
+        460,
+        559,
+        2702
+      ],
+      "percentages": [
+        0.8909126905563255,
+        2.633141952088695,
+        2.969708968521085,
+        2.7915264304098195,
+        4.57335181152247,
+        5.26628390417739,
+        7.2064937636111654,
+        9.107107503464661,
+        11.067115422688577,
+        53.49435755295981
+      ],
+      "total_valid_pixels": 5051,
+      "pixels_in_range": 5051
+    },
+    "bounds": [
+      [
+        44.45306469979732,
+        -121.74879525254055
+      ],
+      [
+        44.86973136644732,
+        -120.87379525257555
+      ]
+    ]
+  },
+  "aoi": {
+    "bounds": [
+      [
+        44.45306469979732,
+        -121.74879525254055
+      ],
+      [
+        44.86973136644732,
+        -120.87379525257555
+      ]
+    ]
+  },
+  "statistics": {
+    "min": 0.12864665687084198,
+    "max": 99.61978912353516,
+    "mean": 80.24754864682811,
+    "std": 24.07857101051207,
+    "count": 5051,
+    "median": null,
+    "percentiles": {}
+  },
+  "histogram": {
+    "bins": [
+      {
+        "range": "0\u201310",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "10\u201320",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "20\u201330",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "30\u201340",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "40\u201350",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "50\u201360",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "60\u201370",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "70\u201380",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "80\u201390",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "90\u2013100",
+        "count": 0,
+        "percentage": 0.0
+      }
+    ]
+  }
+}

@@ -733,6 +733,42 @@ export default function MapExplorer() {
     return parts.join(" · ");
   }
 
+  // Build export filename from current filters
+  // Format: {MapType}_{Species}_{Cover}_{Climate}_{Month}
+  // Example: HSL_DF_50_DRY_04
+  // Note: Backend adds file extensions automatically (.tif, .pdf, etc.)
+  function buildExportName(mapType, species, month, condition, coverPercent, hslCondition, fileExtension = "") {
+    // Map type prefix
+    const mapTypePrefix = mapType === "hsl" ? "HSL" : "Mortality";
+
+    // Species code: DF or WH
+    const speciesCode = species === "Douglas-fir" ? "DF" : "WH";
+
+    // Cover percent (use as-is: 0, 25, 50, 75, 100)
+    const cover = coverPercent || "0";
+
+    // Climate: DRY/WET/NORMAL
+    let climateCode = "DRY";
+    if (mapType === "hsl") {
+      // For HSL, use hslCondition (D/W/N)
+      if (hslCondition === "W") climateCode = "WET";
+      else if (hslCondition === "N") climateCode = "NORMAL";
+      else climateCode = "DRY";
+    } else {
+      // For Mortality, use condition (Dry/Wet/Normal)
+      if (condition === "Wet") climateCode = "WET";
+      else if (condition === "Normal") climateCode = "NORMAL";
+      else climateCode = "DRY";
+    }
+
+    // Month (use as-is: 04-09)
+    const monthCode = month || "04";
+
+    // Build filename (without extension - backend adds it)
+    const filename = `${mapTypePrefix}_${speciesCode}_${cover}_${climateCode}_${monthCode}${fileExtension ? `.${fileExtension}` : ""}`;
+    return filename;
+  }
+
   // ======================================================
   // RASTER FINDER LOGIC
   // ======================================================
@@ -2400,19 +2436,57 @@ export default function MapExplorer() {
         createdRasters[createdRasters.length - 1];
   
       if (!raster) throw new Error("No raster selected to export.");
-  
+
+      // ✅ LOGGING: Log active raster and stats before export
+      console.log("[Export] 📊 Active raster for export:", {
+        activeRasterId: activeCreatedRasterId,
+        rasterId: raster.id,
+        rasterName: raster.name,
+        hasStats: !!raster.stats,
+        stats: raster.stats,
+        hasHistogram: !!raster.histogram,
+        hasBounds: !!raster.bounds,
+      });
+
       // Convert exportFormats (object of booleans) into an array of strings
       const selectedFormats = Object.entries(exportFormats || {})
         .filter(([_, v]) => Boolean(v))
         .map(([k]) => k);
-  
+
+      // Build filename from current filters (use current state, not stale)
+      // Note: Backend adds extensions automatically, so we pass filename without extension
+      // Format: {MapType}_{Species}_{Cover}_{Climate}_{Month}
+      // Example: HSL_DF_50_DRY_04
+      const generatedFilename = buildExportName(mapType, species, month, condition, coverPercent, hslCondition, "").replace(/\.\w+$/, "");
+      
+      // Use generated filename if user didn't provide one
+      const exportFilename = (filename || "").trim() || generatedFilename;
+
+      // Build context with filters, stats, histogram, bounds, and pixelValues
+      // ✅ CRITICAL: Include stats from createdRaster so PDF matches UI
+      const exportContext = {
+        ...(raster.filtersUsed || raster.context || {
+          mapType,
+          species,
+          month,
+          condition,
+          coverPercent,
+          hslCondition,
+        }),
+        // ✅ Include stats, histogram, bounds, and pixelValues so PDF matches UI panel
+        stats: raster.stats || null,
+        histogram: raster.histogram || null,
+        bounds: raster.bounds || raster.overlayBounds || null,
+        pixelValues: raster.pixelValues || [],
+      };
+
       // Build payload matching backend ExportRequest
       const payload = {
         raster_layer_id: raster.activeRasterId ?? raster.raster_layer_id ?? raster.layerId ?? raster.layer_id ?? raster.id,
         user_clip_geojson: raster.aoiGeojson ?? raster.user_clip_geojson ?? raster.userClipGeojson ?? activeAoi?.geoJSON ?? userClip,
-        filename: (filename || "").trim() || null,
+        filename: exportFilename,
         formats: selectedFormats,
-        context: raster.filtersUsed ?? raster.context ?? null,
+        context: exportContext,
         overlay_url: raster.overlayUrl ?? raster.overlay_url ?? null,
         aoi_name: raster.aoiName ?? raster.aoi_name ?? activeAoi?.name ?? null,
       };
