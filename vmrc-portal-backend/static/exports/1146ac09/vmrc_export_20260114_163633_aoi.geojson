@@ -1,0 +1,157 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "bbox": [
+          -119.72576474467019,
+          42.01575512283307,
+          -114.02159816613681,
+          47.06554761335286
+        ],
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -119.33067095568084,
+              42.349115507292765
+            ],
+            [
+              -119.72576474467019,
+              44.52213134673417
+            ],
+            [
+              -119.09608401846845,
+              46.50994697258665
+            ],
+            [
+              -117.25642856348685,
+              47.06554761335286
+            ],
+            [
+              -114.9722925958924,
+              46.59637373892815
+            ],
+            [
+              -114.55250544509119,
+              45.102425349312284
+            ],
+            [
+              -114.1080249324782,
+              44.69498487941701
+            ],
+            [
+              -114.02159816613681,
+              42.73186261537637
+            ],
+            [
+              -114.3055718269729,
+              42.13922193189239
+            ],
+            [
+              -117.4416287770756,
+              42.08983520826865
+            ],
+            [
+              -118.83680371944423,
+              42.04044848464497
+            ],
+            [
+              -118.861497081256,
+              42.01575512283307
+            ],
+            [
+              -119.33067095568084,
+              42.349115507292765
+            ]
+          ]
+        ]
+      },
+      "properties": {
+        "name": "User AOI",
+        "export_date": "2026-01-14T16:36:33.699323",
+        "vmrc_report": {
+          "export_date": "2026-01-14T16:36:33.317744",
+          "export_id": "1146ac09",
+          "software": "VMRC Portal",
+          "raster": {
+            "name": "HSL2.5_DF_50_D_h.tif",
+            "path": "D:\\VMRC_Project\\Data_Analysis!!\\Nov20\\HighStressMortality\\Douglas_Fir\\50\\h\\HSL2.5_DF_50_D_h.tif"
+          },
+          "context": {
+            "mapType": "hsl",
+            "species": "Douglas-fir",
+            "month": "04",
+            "condition": "Dry",
+            "dfStress": "Low Stress",
+            "coverPercent": "50",
+            "hslCondition": "D",
+            "hslClass": "h"
+          },
+          "aoi": {
+            "bounds": {}
+          },
+          "statistics": {
+            "median": null,
+            "percentiles": {}
+          },
+          "histogram": {
+            "bins": [
+              {
+                "range": "0\u201310",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "10\u201320",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "20\u201330",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "30\u201340",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "40\u201350",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "50\u201360",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "60\u201370",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "70\u201380",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "80\u201390",
+                "count": 0,
+                "percentage": 0.0
+              },
+              {
+                "range": "90\u2013100",
+                "count": 0,
+                "percentage": 0.0
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

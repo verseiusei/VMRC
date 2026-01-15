@@ -1,0 +1,28 @@
+<?xml version='1.0' encoding='utf-8'?>
+<metadata xmlns="http://www.esri.com/metadata/" xmlns:esri="http://www.esri.com/metadata/" xmlns:gml="http://www.opengis.net/gml" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.esri.com/metadata/ http://www.esri.com/metadata/esriprof80.xsd">
+  <dataIdInfo>
+    <idCitation>
+      <resTitle>Mortality (Monthly) - Douglas-fir - Month 08</resTitle>
+    </idCitation>
+    <idAbs>This dataset represents mortality (monthly) data for Douglas-fir. Climate condition: Dry. Cover percentage: 50%.</idAbs>
+    <idPurp>VMRC (Vegetation Mortality Risk Calculator) Export Dataset
+
+Map Type: Mortality (Monthly)
+Species: Douglas-fir
+Climate Condition: Dry
+Cover Percentage: 50%
+Month: 08
+HSL Class: mh
+
+This dataset was clipped to a user-defined Area of Interest (AOI) for analysis and visualization.</idPurp>
+    <searchKeys>
+      <keyword>VMRC, Mortality, Douglas_fir, Dry, Cover_50%</keyword>
+    </searchKeys>
+    <idCredit>VMRC Project, University of Idaho</idCredit>
+    <resConst>
+      <Consts>
+        <useLimit>For research and visualization purposes only.</useLimit>
+      </Consts>
+    </resConst>
+  </dataIdInfo>
+</metadata>

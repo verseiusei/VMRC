@@ -1,0 +1,80 @@
+{
+  "export_date": "2026-01-14T16:36:56.376823",
+  "export_id": "e33c1eab",
+  "software": "VMRC Portal",
+  "raster": {
+    "name": "HSL2.5_DF_50_D_l.tif",
+    "path": "D:\\VMRC_Project\\Data_Analysis!!\\Nov20\\HighStressMortality\\Douglas_Fir\\50\\l\\HSL2.5_DF_50_D_l.tif"
+  },
+  "context": {
+    "mapType": "hsl",
+    "species": "Douglas-fir",
+    "month": "04",
+    "condition": "Dry",
+    "dfStress": "Low Stress",
+    "coverPercent": "50",
+    "hslCondition": "D",
+    "hslClass": "l"
+  },
+  "aoi": {
+    "bounds": {}
+  },
+  "statistics": {
+    "median": null,
+    "percentiles": {}
+  },
+  "histogram": {
+    "bins": [
+      {
+        "range": "0\u201310",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "10\u201320",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "20\u201330",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "30\u201340",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "40\u201350",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "50\u201360",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "60\u201370",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "70\u201380",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "80\u201390",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "90\u2013100",
+        "count": 0,
+        "percentage": 0.0
+      }
+    ]
+  }
+}

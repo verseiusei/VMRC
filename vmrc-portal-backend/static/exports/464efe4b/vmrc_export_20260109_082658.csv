@@ -1,0 +1,35 @@
+# VMRC Export Report
+# Export Date: 2026-01-09T08:26:59.035751
+# Export ID: 464efe4b
+# Software: VMRC Portal
+# Raster: M2.5_DF_W07_l.tif
+# Raster Path: D:\VMRC_Project\Data_Analysis!!\Nov20\Mortality-DEC30\Douglas_Fir\75\l\M2.5_DF_W07_l.tif
+# Filter Selections:
+#   Map Type: mortality
+#   Species: Douglas-fir
+#   Condition: Wet
+#   Month: 07
+#   Cover %: 75
+#   Stress Level: Low Stress
+
+Statistics Summary
+Metric,Value
+Count,96713
+Min,0.00
+Max,99.45
+Mean,4.67
+Std Dev,14.96
+Median,0.27
+
+Histogram Bins
+Range,Count,Percentage
+0-10,45679,91.36%
+10-20,1064,2.13%
+20-30,645,1.29%
+30-40,466,0.93%
+40-50,427,0.85%
+50-60,365,0.73%
+60-70,355,0.71%
+70-80,318,0.64%
+80-90,306,0.61%
+90-100,375,0.75%

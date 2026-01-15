@@ -11,6 +11,7 @@ import fiona
 import numpy as np
 import rasterio
 from rasterio.mask import mask
+from rasterio.warp import transform_geom
 
 from shapely.geometry import shape, mapping
 from shapely.ops import unary_union
@@ -139,17 +140,63 @@ def clip_raster_with_global_aoi_and_user_clip(
         bounds    : geographic bounds of clipped region
     """
 
-    # --- 1) Convert inputs ---
-    global_geom = _geojson_to_geom(get_global_aoi_feature())
-    user_geom = _geojson_to_geom(user_clip_geojson)
+    # --- 1) Open raster to get CRS ---
+    with rasterio.open(raster_path) as src:
+        raster_crs = src.crs
+        print("\n========== DEBUG CLIP INFO ==========")
+        print("Raster path:", raster_path)
+        print("Raster bounds:", src.bounds)
+        print("Raster CRS:", raster_crs)
+        print("NODATA:", src.nodata)
+        print("=====================================\n")
 
-    # --- 2) Intersection ---
+    # --- 2) Convert inputs and reproject to raster CRS ---
+    global_aoi_feature = get_global_aoi_feature()
+    global_geom = _geojson_to_geom(global_aoi_feature)
+    user_geom = _geojson_to_geom(user_clip_geojson)
+    
+    # Reproject geometries to raster CRS using rasterio.warp.transform_geom (more precise)
+    # Global AOI: reproject from its source CRS (from shapefile) to raster CRS
+    # User clip: reproject from EPSG:4326 (GeoJSON) to raster CRS
+    print(f"[CLIP] Reprojecting geometries to raster CRS: {raster_crs}")
+    
+    # Get global AOI CRS from shapefile
+    with fiona.open(AOI_SHP_PATH, "r") as shp:
+        global_aoi_crs = shp.crs
+        print(f"[CLIP] Global AOI CRS: {global_aoi_crs}")
+    
+    # Reproject global AOI to raster CRS
+    global_geom_dict = mapping(global_geom)
+    if global_aoi_crs and str(global_aoi_crs) != str(raster_crs):
+        global_geom_raster_crs = transform_geom(
+            global_aoi_crs.to_string() if hasattr(global_aoi_crs, 'to_string') else str(global_aoi_crs),
+            raster_crs.to_string() if hasattr(raster_crs, 'to_string') else str(raster_crs),
+            global_geom_dict,
+            precision=6
+        )
+        global_geom = shape(global_geom_raster_crs)
+        print(f"[CLIP] Global AOI reprojected to raster CRS")
+    else:
+        print(f"[CLIP] Global AOI already in raster CRS")
+    
+    # Reproject user clip to raster CRS (assumed EPSG:4326 input)
+    user_geom_dict = mapping(user_geom)
+    user_geom_raster_crs = transform_geom(
+        "EPSG:4326",
+        raster_crs.to_string() if hasattr(raster_crs, 'to_string') else str(raster_crs),
+        user_geom_dict,
+        precision=6
+    )
+    user_geom = shape(user_geom_raster_crs)
+    print(f"[CLIP] User clip reprojected to raster CRS")
+
+    # --- 3) Intersection in raster CRS ---
     intersection = global_geom.intersection(user_geom)
 
     if intersection.is_empty:
         raise ValueError("No overlap between AOI and user clip polygon.")
 
-    # Bounds (raster is EPSG:4269)
+    # Bounds in raster CRS
     west, south, east, north = intersection.bounds
     bounds_dict = {
         "south": float(south),
@@ -158,23 +205,49 @@ def clip_raster_with_global_aoi_and_user_clip(
         "east": float(east),
     }
 
+    # Convert intersection to GeoJSON dict for mask()
     geom_mapping = mapping(intersection)
 
-    # --- 3) Clip raster ---
+    # --- 4) Clip raster ---
     with rasterio.open(raster_path) as src:
+        print(f"[CLIP] AOI ∩ User bounds (raster CRS): {intersection.bounds}")
 
-        print("\n========== DEBUG CLIP INFO ==========")
-        print("Raster path:", raster_path)
-        print("Raster bounds:", src.bounds)
-        print("Raster CRS:", src.crs)
-        print("NODATA:", src.nodata)
-        print("AOI ∩ User bounds:", intersection.bounds)
-        print("=====================================\n")
-
+        # Determine nodata value: use source nodata if available, otherwise choose based on dtype
+        nodata_value = src.nodata
+        if nodata_value is None:
+            # Choose a safe nodata value based on dtype
+            if np.issubdtype(src.dtypes[0], np.integer):
+                # For integer types, use a value outside typical range
+                if src.dtypes[0] == np.uint8:
+                    nodata_value = 255
+                elif src.dtypes[0] == np.uint16:
+                    nodata_value = 65535
+                else:
+                    nodata_value = -9999
+            else:
+                # For float types
+                nodata_value = -9999  # Use a sentinel value
+            print(f"[CLIP] Source has no nodata, using {nodata_value} as nodata value")
+        
+        # ============================================================
+        # MASK RASTER: Use all_touched=True to include any touched pixel
+        # ============================================================
+        # all_touched=True ensures every pixel that is even slightly touched
+        # by the AOI boundary is included. This guarantees no edge pixels are lost.
+        #
+        # Why this works:
+        # - By default, mask() only includes pixels whose center falls inside the polygon
+        # - all_touched=True includes ANY pixel touched or intersected by the boundary
+        # - Combined with proper CRS reprojection, this ensures complete pixel coverage
+        # ============================================================
+        shapes = [geom_mapping]  # GeoJSON dict in raster CRS
         out_image, out_transform = mask(
             src,
-            [geom_mapping],
-            crop=True
+            shapes,
+            crop=True,  # Crop to geometry bounds (no pre-windowing needed)
+            all_touched=True,  # CRITICAL: Include any pixel touched by boundary
+            filled=True,  # Fill masked areas with nodata
+            nodata=nodata_value  # Use source nodata or safe default
         )
 
         out_meta = src.meta.copy()
@@ -184,15 +257,16 @@ def clip_raster_with_global_aoi_and_user_clip(
             "transform": out_transform,
         })
 
-        nodata = src.nodata if src.nodata is not None else out_meta.get("nodata")
-        out_meta["nodata"] = nodata
+        # Use the nodata value we set in mask() call
+        out_meta["nodata"] = nodata_value
 
     # --- 4) Stats ---
     band = out_image[0].astype(float)
     valid = np.isfinite(band)
 
-    if nodata is not None:
-        valid &= band != nodata
+    # Exclude nodata pixels (these are outside polygon or actual nodata)
+    if nodata_value is not None:
+        valid &= band != nodata_value
 
     values = band[valid]
 

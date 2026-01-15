@@ -1,0 +1,41 @@
+{
+  "rasters": [
+    {
+      "raster_id": 1,
+      "title": "Douglas-fir Mortality - April, Dry, Low Stress, 50% Cover",
+      "summary": "Monthly mortality risk map for Douglas-fir under dry conditions in April with low stress levels and 50% canopy cover.",
+      "tags": ["mortality", "douglas-fir", "april", "dry", "low-stress", "50-cover"],
+      "credits": "VMRC Research Team",
+      "units": "percent",
+      "crs": "EPSG:4326"
+    },
+    {
+      "raster_id": 2,
+      "title": "Western Hemlock Mortality - May, Wet, 75% Cover",
+      "summary": "Monthly mortality risk map for Western Hemlock under wet conditions in May with 75% canopy cover.",
+      "tags": ["mortality", "western-hemlock", "may", "wet", "75-cover"],
+      "credits": "VMRC Research Team",
+      "units": "percent",
+      "crs": "EPSG:4326"
+    },
+    {
+      "raster_id": 29,
+      "title": "Douglas-fir HSL - Dry, Low, 50% Cover",
+      "summary": "High Stress Level map for Douglas-fir under dry conditions with low stress class and 50% canopy cover.",
+      "tags": ["hsl", "douglas-fir", "dry", "low", "50-cover"],
+      "credits": "VMRC Research Team",
+      "units": "percent",
+      "crs": "EPSG:4326"
+    },
+    {
+      "raster_id": 33,
+      "title": "Western Hemlock HSL - Normal, 25% Cover",
+      "summary": "High Stress Level map for Western Hemlock under normal conditions with 25% canopy cover.",
+      "tags": ["hsl", "western-hemlock", "normal", "25-cover"],
+      "credits": "VMRC Research Team",
+      "units": "percent",
+      "crs": "EPSG:4326"
+    }
+  ]
+}
+

@@ -47,7 +47,7 @@ export default function RasterOverlay({ overlayUrl, bounds }) {
       opacity={1.0}
       interactive={false} // let clicks pass through to map
       zIndex={200}
-      className="vmrc-raster-overlay"
+      className="vmrc-raster-overlay raster-overlay-pixelated"
     />
   );
 }

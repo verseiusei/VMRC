@@ -1,0 +1,27 @@
+<?xml version='1.0' encoding='utf-8'?>
+<metadata xmlns="http://www.esri.com/metadata/" xmlns:esri="http://www.esri.com/metadata/" xmlns:gml="http://www.opengis.net/gml" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.esri.com/metadata/ http://www.esri.com/metadata/esriprof80.xsd">
+  <dataIdInfo>
+    <idCitation>
+      <resTitle>High Stress Level - Douglas-fir</resTitle>
+    </idCitation>
+    <idAbs>This dataset represents high stress level data for Douglas-fir. Climate condition: Dry. Cover percentage: 50%.</idAbs>
+    <idPurp>VMRC (Vegetation Mortality Risk Calculator) Export Dataset
+
+Map Type: High Stress Level
+Species: Douglas-fir
+Climate Condition: Dry
+Cover Percentage: 50%
+HSL Class: l
+
+This dataset was clipped to a user-defined Area of Interest (AOI) for analysis and visualization.</idPurp>
+    <searchKeys>
+      <keyword>VMRC, HSL, Douglas_fir, Dry, Cover_50%</keyword>
+    </searchKeys>
+    <idCredit>VMRC Project, University of Idaho</idCredit>
+    <resConst>
+      <Consts>
+        <useLimit>For research and visualization purposes only.</useLimit>
+      </Consts>
+    </resConst>
+  </dataIdInfo>
+</metadata>

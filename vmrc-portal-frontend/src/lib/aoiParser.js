@@ -88,6 +88,12 @@ export async function parseKMLFile(file) {
   const parser = new DOMParser();
   const doc = parser.parseFromString(text, "text/xml");
   
+  // Check for XML parsing errors
+  const parseError = doc.querySelector("parsererror");
+  if (parseError) {
+    throw new Error("Invalid KML file: XML parsing failed. Please ensure the file is a valid KML document.");
+  }
+  
   const placemarks = doc.querySelectorAll("Placemark");
   const features = [];
   
@@ -98,34 +104,35 @@ export async function parseKMLFile(file) {
     if (coordinatesEl) {
       const coordsText = coordinatesEl.textContent.trim();
       const coordPairs = coordsText.split(/\s+/).map((pair) => {
-        const [lon, lat] = pair.split(",").map(Number);
+        const parts = pair.split(",");
+        if (parts.length < 2) {
+          throw new Error("Invalid KML coordinates: each coordinate must have at least longitude and latitude");
+        }
+        const [lon, lat] = [Number(parts[0]), Number(parts[1])];
+        if (isNaN(lon) || isNaN(lat)) {
+          throw new Error("Invalid KML coordinates: longitude and latitude must be numbers");
+        }
         return [lon, lat];
       });
       
-      // Determine geometry type from coordinates
-      let geometry;
-      if (coordPairs.length === 1) {
-        geometry = { type: "Point", coordinates: coordPairs[0] };
-      } else if (coordPairs.length === 2) {
-        geometry = { type: "LineString", coordinates: coordPairs };
-      } else {
-        // Assume Polygon (close the ring)
+      // Only create Polygon geometries (AOI requires polygons)
+      // Skip Points and LineStrings
+      if (coordPairs.length >= 3) {
+        // Create Polygon (close the ring)
         const closed = [...coordPairs, coordPairs[0]];
-        geometry = { type: "Polygon", coordinates: [closed] };
+        features.push({
+          type: "Feature",
+          geometry: { type: "Polygon", coordinates: [closed] },
+          properties: {
+            name: nameEl?.textContent || "Unnamed",
+          },
+        });
       }
-      
-      features.push({
-        type: "Feature",
-        geometry,
-        properties: {
-          name: nameEl?.textContent || "Unnamed",
-        },
-      });
     }
   });
   
   if (features.length === 0) {
-    throw new Error("No valid features found in KML file");
+    throw new Error("No valid polygon features found in KML file. KML must contain Placemark elements with at least 3 coordinates to form a polygon.");
   }
   
   return {
