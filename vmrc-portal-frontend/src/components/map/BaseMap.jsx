@@ -515,7 +515,7 @@ function MapTools({ onUserClipChange, onRemoveAoi, aois = [], onDrawStart = null
           lastDrawnAoiRef.current = null; // Clear persistent GeoJSON ref
         }
         
-        // CRITICAL: Call onRemoveAoi FIRST to trigger LayerGroupManager.deletePairByAoiId
+        // CRITICAL: Call onRemoveAoi FIRST to trigger LayerGroupManager.removeAoiAndAllRasters
         // This ensures the AOI is removed from LayerGroupManager's registry
         if (aoiId && onRemoveAoi) {
           console.log("[MapTools] Calling onRemoveAoi with aoiId:", aoiId, "(triggers LayerGroupManager cleanup)");
@@ -1316,6 +1316,7 @@ export default function BaseMap({
   onRemoveAoi = null, // Optional callback to remove AOI by ID
   onRemoveRaster = null, // Optional callback to remove raster overlay by ID
   onRemoveRasterByAoiId = null, // Optional callback to remove raster overlay by AOI ID
+  onClearAll = null, // Optional callback when Clear All is called: () => void
   onDrawStart = null, // Callback when new AOI is created (to clear overlays)
   onClearDrawnAoi = null, // Optional callback when drawn AOI geometry should be cleared
   activeRasterId,
@@ -1385,6 +1386,7 @@ export default function BaseMap({
           onRemoveAoi={onRemoveAoi}
           onRemoveRaster={onRemoveRaster}
           onRemoveRasterByAoiId={onRemoveRasterByAoiId}
+          onClearAll={onClearAll}
         />
 
         {/* Legacy: Single overlay support (for backward compatibility) */}

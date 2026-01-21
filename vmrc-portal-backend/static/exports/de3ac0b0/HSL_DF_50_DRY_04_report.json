@@ -1,0 +1,168 @@
+{
+  "export_date": "2026-01-21T05:39:15.128486",
+  "export_id": "de3ac0b0",
+  "software": "VMRC Portal",
+  "raster": {
+    "name": "HSL2.5_DF_50_D_l.tif",
+    "path": "D:\\VMRC_Project\\Data_Analysis!!\\Nov20\\HighStressMortality\\Douglas_Fir\\50\\l\\HSL2.5_DF_50_D_l.tif"
+  },
+  "context": {
+    "mapType": "hsl",
+    "species": "Douglas-fir",
+    "month": "04",
+    "condition": "Dry",
+    "dfStress": "Low Stress",
+    "coverPercent": "50",
+    "hslCondition": "D",
+    "hslClass": "l",
+    "stats": {
+      "min": 66.03792572021484,
+      "max": 76.88020324707031,
+      "mean": 70.82756042480469,
+      "std": 2.9854275627483333,
+      "count": 8
+    },
+    "histogram": {
+      "bins": [
+        0,
+        10,
+        20,
+        30,
+        40,
+        50,
+        60,
+        70,
+        80,
+        90,
+        100
+      ],
+      "counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        3,
+        5,
+        0,
+        0
+      ],
+      "percentages": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        37.5,
+        62.5,
+        0,
+        0
+      ],
+      "total_valid_pixels": 8,
+      "pixels_in_range": 8
+    },
+    "bounds": [
+      [
+        44.73639803311932,
+        -123.43212858580655
+      ],
+      [
+        44.76139803311832,
+        -123.38212858580856
+      ]
+    ],
+    "pixelValues": [
+      72.16547393798828,
+      76.88020324707031,
+      68.59581756591797,
+      68.99749755859375,
+      71.04046630859375,
+      70.82574462890625,
+      72.07735443115234,
+      66.03792572021484
+    ]
+  },
+  "aoi": {
+    "bounds": [
+      [
+        44.73639803311932,
+        -123.43212858580655
+      ],
+      [
+        44.76139803311832,
+        -123.38212858580856
+      ]
+    ]
+  },
+  "statistics": {
+    "min": 66.03792572021484,
+    "max": 76.88020324707031,
+    "mean": 70.82756042480469,
+    "std": 2.9854275627483333,
+    "count": 8,
+    "median": 70.93310546875,
+    "percentiles": {
+      "p10": 66.03792572021484,
+      "p25": 68.59581756591797,
+      "p50": 70.82574462890625,
+      "p75": 72.07735443115234,
+      "p90": 72.16547393798828
+    }
+  },
+  "histogram": {
+    "bins": [
+      {
+        "range": "0\u201310",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "10\u201320",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "20\u201330",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "30\u201340",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "40\u201350",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "50\u201360",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "60\u201370",
+        "count": 3,
+        "percentage": 37.5
+      },
+      {
+        "range": "70\u201380",
+        "count": 5,
+        "percentage": 62.5
+      },
+      {
+        "range": "80\u201390",
+        "count": 0,
+        "percentage": 0.0
+      },
+      {
+        "range": "90\u2013100",
+        "count": 0,
+        "percentage": 0.0
+      }
+    ]
+  }
+}

@@ -137,7 +137,7 @@ function computeGeometryHash(geojson) {
  * Pairing System:
  * - When an AOI layer is created, it's marked with layer.__aoiId = aoi.id
  * - When a raster overlay is created, it finds the AOI layer by aoiId and registers the pair
- * - When an AOI is erased (pm:remove), deletePairByAoiId() removes both AOI and overlay (full delete, user intent)
+ * - When an AOI is erased (pm:remove), removeAoiAndAllRasters() removes AOI and ALL its rasters (full delete, user intent)
  * - When regenerating overlays, removeOverlayForAoiId() removes only overlay, keeps AOI (system delete, no state clear)
  * - Base AOI (__locked=true) is always protected from deletion
  */
@@ -149,6 +149,7 @@ export default function LayerGroupManager({
   onRemoveAoi, // Callback when AOI is removed: (aoiId) => void
   onRemoveRaster, // Callback when raster overlay is removed: (rasterId) => void
   onRemoveRasterByAoiId, // Callback when raster overlay is removed by AOI ID: (aoiId) => void
+  onClearAll, // Callback when Clear All is called: () => void
 }) {
   const map = useMap();
 
@@ -169,12 +170,23 @@ export default function LayerGroupManager({
   // Tracks AOI layers independently of raster overlays
   const aoiLayersById = useRef(new Map()); // key: aoiId, value: { layer, hash }
   
-  // rasterOverlaysByRasterId: Maps rasterId -> { layer, bounds, aoiId }
+  // overlayByRasterId: Maps rasterId -> Leaflet ImageOverlay layer (PRIMARY REGISTRY)
+  // This is the single source of truth for all overlay layers
+  const overlayByRasterId = useRef(new Map()); // key: rasterId, value: L.ImageOverlay layer
+  
+  // rasterOverlaysByRasterId: Maps rasterId -> { layer, bounds, aoiId } (LEGACY - kept for compatibility)
   // Tracks raster overlay layers independently of AOIs
   const rasterOverlaysByRasterId = useRef(new Map()); // key: rasterId, value: { layer, bounds, aoiId }
   
-  // pairByAoiId: Maps aoiId -> rasterId (optional mapping for lookup)
-  const pairByAoiId = useRef(new Map()); // key: aoiId, value: rasterId
+  // rasterIdsByAoiId: Maps aoiId -> Set of rasterIds (multiple rasters per AOI)
+  // This tracks which rasters belong to which AOI
+  const rasterIdsByAoiId = useRef(new Map()); // key: aoiId, value: Set<rasterId>
+  
+  // pairByAoiId: Maps aoiId -> Set of rasterIds (LEGACY - kept for compatibility, use rasterIdsByAoiId)
+  const pairByAoiId = useRef(new Map()); // key: aoiId, value: Set<rasterId>
+  
+  // activeRasterByAoiId: Maps aoiId -> activeRasterId (tracks which raster is currently visible per AOI)
+  const activeRasterByAoiId = useRef(new Map()); // key: aoiId, value: rasterId
   
   // Legacy refs (kept for backward compatibility during transition)
   const aoiLayersRef = useRef(new Map()); // Unified registry (deprecated, use aoiLayersById)
@@ -199,12 +211,17 @@ export default function LayerGroupManager({
   const removalModeRef = useRef(false); // Track if Geoman removal mode is active
 
   // ============================================================
-  // HELPER: TAG AOI LAYER (SAFE - prevents setting properties on strings)
+  // HOISTED HELPER FUNCTIONS (function declarations - hoisted)
   // ============================================================
-  // Safely tags a Leaflet layer with AOI ID
-  // Guards against accidentally tagging strings or non-objects
+  // These functions are hoisted and can be called before they appear in code
+  // They access refs and map via closure
   // ============================================================
-  const tagAoiLayer = useCallback((layer, aoiId) => {
+
+  /**
+   * Safely tags a Leaflet layer with AOI ID
+   * Guards against accidentally tagging strings or non-objects
+   */
+  function tagAoiLayer(layer, aoiId) {
     if (!layer || typeof layer !== "object") {
       console.warn("[LayerGroupManager] tagAoiLayer skipped: not a Leaflet layer", { layer, aoiId, layerType: typeof layer });
       return;
@@ -212,15 +229,13 @@ export default function LayerGroupManager({
     layer.__aoiId = aoiId;
     layer.options = layer.options || {};
     layer.options.__aoiId = aoiId;
-  }, []);
+  }
 
-  // ============================================================
-  // HELPER: TAG RASTER OVERLAY (SAFE - prevents setting properties on strings)
-  // ============================================================
-  // Safely tags a Leaflet overlay layer with raster ID
-  // Guards against accidentally tagging strings or non-objects
-  // ============================================================
-  const tagRasterOverlay = useCallback((layer, rasterId) => {
+  /**
+   * Safely tags a Leaflet overlay layer with raster ID
+   * Guards against accidentally tagging strings or non-objects
+   */
+  function tagRasterOverlay(layer, rasterId) {
     if (!layer || typeof layer !== "object") {
       console.warn("[LayerGroupManager] tagRasterOverlay skipped: not a Leaflet layer", { layer, rasterId, layerType: typeof layer });
       return;
@@ -228,7 +243,368 @@ export default function LayerGroupManager({
     layer.__rasterId = rasterId;
     layer.options = layer.options || {};
     layer.options.__rasterId = rasterId;
-  }, []);
+  }
+
+  /**
+   * Register a raster overlay - THE ONLY WAY TO CREATE OVERLAYS
+   * @param {Object} params - { rasterId, aoiId, overlayUrl, bounds, opacity }
+   * @returns {L.ImageOverlay|null} The created overlay layer, or null if failed
+   */
+  function registerRasterOverlay({ rasterId, aoiId, overlayUrl, bounds, opacity = 1.0 }) {
+    if (!map || !overlayLayerGroupRef.current) {
+      console.warn("[LayerGroupManager] registerRasterOverlay: Map or overlay group not available");
+      return null;
+    }
+
+    if (!rasterId || !overlayUrl || !bounds) {
+      console.warn("[LayerGroupManager] registerRasterOverlay: Missing required parameters", { rasterId, overlayUrl, bounds });
+      return null;
+    }
+
+    // Check if overlay already exists
+    if (overlayByRasterId.current.has(rasterId)) {
+      console.log(`[LayerGroupManager] registerRasterOverlay: Overlay ${rasterId} already exists, skipping`);
+      return overlayByRasterId.current.get(rasterId);
+    }
+
+    const BACKEND_BASE = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8000";
+    const fullUrl = overlayUrl.startsWith("http")
+      ? overlayUrl
+      : `${BACKEND_BASE}${overlayUrl}`;
+
+    // Convert bounds to Leaflet format if needed
+    let leafletBounds;
+    if (Array.isArray(bounds) && bounds.length === 2) {
+      leafletBounds = bounds;
+    } else if (bounds.south !== undefined) {
+      leafletBounds = [
+        [bounds.south, bounds.west],
+        [bounds.north, bounds.east],
+      ];
+    } else {
+      console.warn("[LayerGroupManager] registerRasterOverlay: Invalid bounds format", bounds);
+      return null;
+    }
+
+    // Validate bounds
+    try {
+      const testBounds = L.latLngBounds(leafletBounds);
+      if (!testBounds.isValid()) {
+        console.warn("[LayerGroupManager] registerRasterOverlay: Invalid Leaflet bounds", leafletBounds);
+        return null;
+      }
+    } catch (err) {
+      console.warn("[LayerGroupManager] registerRasterOverlay: Error validating bounds", err);
+      return null;
+    }
+
+    // Create overlay layer
+    const overlay = L.imageOverlay(fullUrl, leafletBounds, {
+      opacity: opacity,
+      interactive: false,
+      pane: "rasterPane",
+      className: "raster-overlay-pixelated",
+    });
+
+    overlay.options.__overlayId = rasterId;
+    overlay._pmIgnore = true;
+    overlay.__bounds = leafletBounds;
+
+    // Tag with rasterId and aoiId
+    tagRasterOverlay(overlay, rasterId);
+    if (aoiId) {
+      tagAoiLayer(overlay, aoiId);
+    }
+
+    // ✅ CRITICAL: Register in PRIMARY registry (overlayByRasterId)
+    overlayByRasterId.current.set(rasterId, overlay);
+    
+    // Also register in legacy registry for backward compatibility
+    rasterOverlaysByRasterId.current.set(rasterId, {
+      layer: overlay,
+      bounds: leafletBounds,
+      aoiId: aoiId,
+    });
+
+    // ✅ CRITICAL: Register in rasterIdsByAoiId (track which rasters belong to which AOI)
+    if (aoiId) {
+      const rasterSet = rasterIdsByAoiId.current.get(aoiId) || new Set();
+      rasterSet.add(rasterId);
+      rasterIdsByAoiId.current.set(aoiId, rasterSet);
+      
+      // Also update legacy pairByAoiId for backward compatibility
+      const legacySet = pairByAoiId.current.get(aoiId) || new Set();
+      legacySet.add(rasterId);
+      pairByAoiId.current.set(aoiId, legacySet);
+    }
+
+    // Add to layer group
+    overlayLayerGroupRef.current.addLayer(overlay);
+
+    console.log(`[LayerGroupManager] ✅ Registered raster overlay: rasterId=${rasterId}, aoiId=${aoiId}, opacity=${opacity}`);
+    console.log(`[LayerGroupManager] Registry sizes: overlayByRasterId=${overlayByRasterId.current.size}, rasterIdsByAoiId=${rasterIdsByAoiId.current.size}`);
+    
+    return overlay;
+  }
+
+  /**
+   * Remove a raster overlay from the map and registry
+   * @param {string} rasterId - The raster ID to remove
+   */
+  function removeRasterOverlay(rasterId) {
+    if (!map || !overlayLayerGroupRef.current) {
+      console.warn("[LayerGroupManager] removeRasterOverlay: Map or overlay group not available");
+      return;
+    }
+
+    // ✅ CRITICAL: Use overlayByRasterId (PRIMARY REGISTRY)
+    const overlay = overlayByRasterId.current.get(rasterId);
+    if (!overlay) {
+      console.warn(`[LayerGroupManager] removeRasterOverlay: Overlay ${rasterId} not found in registry`);
+      return;
+    }
+
+    // ✅ CRITICAL: Remove from map - MUST remove from both layer group AND map directly
+    try {
+      // Remove from layer group first
+      if (overlayLayerGroupRef.current?.hasLayer(overlay)) {
+        overlayLayerGroupRef.current.removeLayer(overlay);
+        console.log(`[LayerGroupManager] removeRasterOverlay: Removed overlay ${rasterId} from layer group`);
+      }
+      // Also remove directly from map (in case it was added directly)
+      if (map.hasLayer && map.hasLayer(overlay)) {
+        map.removeLayer(overlay);
+        console.log(`[LayerGroupManager] removeRasterOverlay: Removed overlay ${rasterId} from map directly`);
+      }
+      
+      // ✅ VERIFICATION: Double-check it's actually gone
+      if (map.hasLayer && map.hasLayer(overlay)) {
+        console.warn(`[LayerGroupManager] ⚠️ WARNING: Overlay ${rasterId} still on map after removal attempt!`);
+      }
+    } catch (err) {
+      console.warn(`[LayerGroupManager] Error removing overlay ${rasterId}:`, err);
+    }
+
+    // Get aoiId before removing from registry
+    const overlayInfo = rasterOverlaysByRasterId.current.get(rasterId);
+    const aoiId = overlayInfo?.aoiId;
+
+    // Remove from PRIMARY registry
+    overlayByRasterId.current.delete(rasterId);
+    
+    // Remove from legacy registry
+    rasterOverlaysByRasterId.current.delete(rasterId);
+
+    // Update rasterIdsByAoiId
+    if (aoiId) {
+      const rasterSet = rasterIdsByAoiId.current.get(aoiId);
+      if (rasterSet) {
+        rasterSet.delete(rasterId);
+        if (rasterSet.size === 0) {
+          rasterIdsByAoiId.current.delete(aoiId);
+        } else {
+          rasterIdsByAoiId.current.set(aoiId, rasterSet);
+        }
+      }
+      
+      // Also update legacy pairByAoiId
+      const legacySet = pairByAoiId.current.get(aoiId);
+      if (legacySet) {
+        legacySet.delete(rasterId);
+        if (legacySet.size === 0) {
+          pairByAoiId.current.delete(aoiId);
+        } else {
+          pairByAoiId.current.set(aoiId, legacySet);
+        }
+      }
+      
+      // Clear active raster if it was this one
+      if (activeRasterByAoiId.current.get(aoiId) === rasterId) {
+        activeRasterByAoiId.current.delete(aoiId);
+      }
+    }
+
+    console.log(`[LayerGroupManager] ✅ Removed raster overlay: rasterId=${rasterId}`);
+  }
+
+  /**
+   * Remove all rasters for an AOI
+   * @param {string} aoiId - The AOI ID
+   */
+  function removeAllRastersForAoi(aoiId) {
+    if (!aoiId) {
+      console.warn("[LayerGroupManager] removeAllRastersForAoi: No aoiId provided");
+      return;
+    }
+
+    // ✅ CRITICAL: Use rasterIdsByAoiId to get all raster IDs for this AOI
+    const rasterSet = rasterIdsByAoiId.current.get(aoiId);
+    if (!rasterSet || rasterSet.size === 0) {
+      console.log(`[LayerGroupManager] removeAllRastersForAoi: No rasters found for AOI ${aoiId}`);
+      return;
+    }
+
+    const rasterIds = Array.from(rasterSet);
+    console.log(`[LayerGroupManager] removeAllRastersForAoi: Removing ${rasterIds.length} raster(s) for AOI ${aoiId}`);
+
+    // ✅ CRITICAL: Remove each raster overlay from map FIRST
+    for (const rasterId of rasterIds) {
+      const overlay = overlayByRasterId.current.get(rasterId);
+      if (overlay) {
+        // Remove from map directly
+        try {
+          if (overlayLayerGroupRef.current?.hasLayer(overlay)) {
+            overlayLayerGroupRef.current.removeLayer(overlay);
+          }
+          if (map.hasLayer && map.hasLayer(overlay)) {
+            map.removeLayer(overlay);
+          }
+          console.log(`[LayerGroupManager] removeAllRastersForAoi: Removed overlay ${rasterId} from map`);
+        } catch (err) {
+          console.warn(`[LayerGroupManager] Error removing overlay ${rasterId} from map:`, err);
+        }
+      }
+      // Remove from registries
+      removeRasterOverlay(rasterId);
+    }
+
+    // Clean up the set
+    rasterIdsByAoiId.current.delete(aoiId);
+    
+    // Also clean up legacy pairByAoiId
+    pairByAoiId.current.delete(aoiId);
+    
+    // Clear active raster for this AOI
+    activeRasterByAoiId.current.delete(aoiId);
+
+    // ✅ VERIFICATION: Double-check all overlays are removed from map
+    let remainingOnMap = 0;
+    if (map.eachLayer) {
+      map.eachLayer((layer) => {
+        if (layer instanceof L.ImageOverlay) {
+          const layerRasterId = layer.__rasterId || layer.options?.__rasterId;
+          if (layerRasterId && rasterIds.includes(layerRasterId)) {
+            remainingOnMap++;
+            console.warn(`[LayerGroupManager] ⚠️ Overlay ${layerRasterId} still on map after removeAllRastersForAoi!`);
+            // Force remove it
+            try {
+              if (overlayLayerGroupRef.current?.hasLayer(layer)) {
+                overlayLayerGroupRef.current.removeLayer(layer);
+              }
+              if (map.hasLayer && map.hasLayer(layer)) {
+                map.removeLayer(layer);
+              }
+            } catch (err) {
+              console.warn(`[LayerGroupManager] Error force-removing overlay ${layerRasterId}:`, err);
+            }
+          }
+        }
+      });
+    }
+    
+    if (remainingOnMap > 0) {
+      console.warn(`[LayerGroupManager] ⚠️ ${remainingOnMap} overlay(s) still on map after removeAllRastersForAoi - force removed`);
+    }
+
+    console.log(`[LayerGroupManager] ✅ Removed all rasters for AOI: aoiId=${aoiId}`);
+  }
+
+  /**
+   * Clear all AOIs and overlays from the map and registries
+   * This is called when "Clear All" button is clicked
+   */
+  function clearAll() {
+    if (!map) {
+      console.warn("[LayerGroupManager] clearAll: Map not available");
+      return;
+    }
+
+    console.log("[LayerGroupManager] clearAll: Removing ALL AOIs and overlays");
+
+    // ✅ CRITICAL: Remove ALL overlay layers from map using overlayByRasterId (PRIMARY REGISTRY)
+    const overlayCount = overlayByRasterId.current.size;
+    const rasterIds = Array.from(overlayByRasterId.current.keys());
+    
+    console.log(`[LayerGroupManager] clearAll: Removing ${overlayCount} overlay(s) from map`);
+    
+    for (const rasterId of rasterIds) {
+      const overlay = overlayByRasterId.current.get(rasterId);
+      if (overlay) {
+        try {
+          if (overlayLayerGroupRef.current?.hasLayer(overlay)) {
+            overlayLayerGroupRef.current.removeLayer(overlay);
+          }
+          if (map.hasLayer && map.hasLayer(overlay)) {
+            map.removeLayer(overlay);
+          }
+        } catch (err) {
+          console.warn(`[LayerGroupManager] Error removing overlay ${rasterId}:`, err);
+        }
+      }
+    }
+
+    // Remove ALL AOI layers from map (except base AOI)
+    const aoiCount = aoiLayersById.current.size;
+    for (const [aoiId, aoiLayerInfo] of aoiLayersById.current.entries()) {
+      const aoiLayer = aoiLayerInfo?.layer;
+      
+      // NEVER delete base AOI
+      if (aoiLayer?.__locked || aoiLayer?.options?.__locked || aoiLayer === baseAoiLayerRef.current) {
+        continue;
+      }
+
+      if (aoiLayer) {
+        try {
+          if (uploadedAoiLayerGroupRef.current?.hasLayer(aoiLayer)) {
+            uploadedAoiLayerGroupRef.current.removeLayer(aoiLayer);
+          } else if (drawnAoiLayerGroupRef.current?.hasLayer(aoiLayer)) {
+            drawnAoiLayerGroupRef.current.removeLayer(aoiLayer);
+          } else if (map.hasLayer && map.hasLayer(aoiLayer)) {
+            map.removeLayer(aoiLayer);
+          }
+        } catch (err) {
+          console.warn(`[LayerGroupManager] Error removing AOI layer ${aoiId}:`, err);
+        }
+      }
+    }
+
+    // Clear ALL registries
+    overlayByRasterId.current.clear(); // ✅ CRITICAL: Clear PRIMARY registry
+    rasterOverlaysByRasterId.current.clear();
+    rasterIdsByAoiId.current.clear();
+    aoiLayersById.current.clear();
+    aoiLayersRef.current.clear();
+    pairByAoiId.current.clear();
+    activeRasterByAoiId.current.clear();
+    pairsRef.current.clear();
+    uploadedLayersRef.current.clear();
+    drawnLayerRef.current = null;
+
+    // ✅ LEAK DETECTION: Log registry state after clearing
+    const remainingOverlays = overlayByRasterId.current.size;
+    const mapLayerCount = map._layers ? Object.keys(map._layers).length : 0;
+    let imageOverlayCount = 0;
+    if (map.eachLayer) {
+      map.eachLayer((layer) => {
+        if (layer instanceof L.ImageOverlay) {
+          imageOverlayCount++;
+        }
+      });
+    }
+    
+    console.log(`[LayerGroupManager] clearAll: ✅ Removed ${overlayCount} overlay(s) and ${aoiCount} AOI layer(s)`);
+    console.log(`[LayerGroupManager] LEAK DETECTION: overlayByRasterId.size=${remainingOverlays}, map._layers=${mapLayerCount}, ImageOverlay layers=${imageOverlayCount}`);
+    
+    if (remainingOverlays === 0 && imageOverlayCount > 0) {
+      console.warn(`[LayerGroupManager] ⚠️ LEAK DETECTED: ${imageOverlayCount} ImageOverlay layer(s) still on map but not in registry!`);
+    }
+
+    // Call callback to reset React state
+    if (onClearAll) {
+      console.log("[LayerGroupManager] clearAll: Calling onClearAll() to reset React state");
+      onClearAll();
+    }
+  }
 
   // ============================================================
   // CLEAR PM TEMP LAYERS (PREVIEW/HINT LAYERS)
@@ -411,7 +787,11 @@ export default function LayerGroupManager({
         bounds: pendingOverlay.overlayLayer.__bounds,
         aoiId: aoiId,
       });
-      pairByAoiId.current.set(aoiId, pendingOverlay.rasterId);
+      
+      // Update pair mapping (use Set to track multiple rasters per AOI)
+      const rasterSet = pairByAoiId.current.get(aoiId) || new Set();
+      rasterSet.add(pendingOverlay.rasterId);
+      pairByAoiId.current.set(aoiId, rasterSet);
       
       // Also register in legacy pair registry (for backward compatibility)
       pairsRef.current.set(aoiId, {
@@ -453,26 +833,6 @@ export default function LayerGroupManager({
       return;
     }
 
-    // If AOI already has an overlay, remove ONLY the overlay layer
-    const existingRasterId = pairByAoiId.current.get(aoiId);
-    if (existingRasterId) {
-      const existingOverlay = rasterOverlaysByRasterId.current.get(existingRasterId);
-      if (existingOverlay && existingOverlay.layer) {
-        console.log(`[LayerGroupManager] Replacing overlay for AOI ${aoiId} (old raster: ${existingRasterId}, new raster: ${rasterId})`);
-        try {
-          if (overlayLayerGroupRef.current?.hasLayer(existingOverlay.layer)) {
-            overlayLayerGroupRef.current.removeLayer(existingOverlay.layer);
-          }
-          if (map.hasLayer && map.hasLayer(existingOverlay.layer)) {
-            map.removeLayer(existingOverlay.layer);
-          }
-        } catch (err) {
-          console.warn("[LayerGroupManager] Error removing old overlay:", err);
-        }
-        rasterOverlaysByRasterId.current.delete(existingRasterId);
-      }
-    }
-
     // ✅ CRITICAL: Tag raster overlay with rasterId using safe function
     // Raster overlays use __rasterId, AOI layers use __aoiId (separate keyspaces)
     tagRasterOverlay(overlayLayer, rasterId);
@@ -487,7 +847,11 @@ export default function LayerGroupManager({
       bounds: bounds,
       aoiId: aoiId,
     });
-    pairByAoiId.current.set(aoiId, rasterId);
+    
+    // Update pair mapping (use Set to track multiple rasters per AOI)
+    const rasterSet = pairByAoiId.current.get(aoiId) || new Set();
+    rasterSet.add(rasterId);
+    pairByAoiId.current.set(aoiId, rasterSet);
 
     // Also register in legacy pair registry (for backward compatibility)
     const aoiLayer = aoiLayersById.current.get(aoiId)?.layer || aoiLayersRef.current.get(aoiId);
@@ -516,46 +880,56 @@ export default function LayerGroupManager({
   const removeOverlayForAoiId = useCallback((aoiId) => {
     if (!aoiId) {
       console.warn("[LayerGroupManager] removeOverlayForAoiId: No aoiId provided");
-      return;
+      return false;
     }
 
-    // Find the pair using app-level aoiId
-    const pair = pairsRef.current.get(aoiId);
-    if (!pair) {
-      console.log(`[LayerGroupManager] removeOverlayForAoiId: No pair found for aoiId: ${aoiId}`);
-      return;
+    // ✅ DEFENSIVE: Check if there are any rasters for this AOI
+    const rasterSet = rasterIdsByAoiId.current.get(aoiId);
+    if (!rasterSet || rasterSet.size === 0) {
+      console.log(`[LayerGroupManager] removeOverlayForAoiId: No rasters found for AOI ${aoiId}, skipping`);
+      return false;
     }
 
-    const { overlayLayer, createdRasterId } = pair;
+    console.log(`[LayerGroupManager] removeOverlayForAoiId: Removing ${rasterSet.size} overlay(s) for AOI ${aoiId} (AOI preserved)`);
 
-    console.log(`[LayerGroupManager] removeOverlayForAoiId: Removing overlay only (Raster: ${createdRasterId}, AOI: ${aoiId}) - AOI layer preserved`);
-
-    // Remove overlay from map
-    if (overlayLayer) {
-      try {
-        if (overlayLayerGroupRef.current?.hasLayer(overlayLayer)) {
-          overlayLayerGroupRef.current.removeLayer(overlayLayer);
+    const rasterIds = Array.from(rasterSet);
+    
+    // ✅ CRITICAL: Remove overlays from map using overlayByRasterId (PRIMARY REGISTRY)
+    for (const rasterId of rasterIds) {
+      const overlay = overlayByRasterId.current.get(rasterId);
+      if (overlay) {
+        try {
+          if (overlayLayerGroupRef.current?.hasLayer(overlay)) {
+            overlayLayerGroupRef.current.removeLayer(overlay);
+          }
+          if (map.hasLayer && map.hasLayer(overlay)) {
+            map.removeLayer(overlay);
+          }
+        } catch (err) {
+          console.warn(`[LayerGroupManager] Error removing overlay ${rasterId}:`, err);
         }
-        if (map.hasLayer && map.hasLayer(overlayLayer)) {
-          map.removeLayer(overlayLayer);
-        }
-        console.log(`[LayerGroupManager] removeOverlayForAoiId: Removed overlay layer from map`);
-      } catch (err) {
-        console.warn(`[LayerGroupManager] Error removing overlay:`, err);
       }
+      
+      // Remove from registries
+      overlayByRasterId.current.delete(rasterId);
+      rasterOverlaysByRasterId.current.delete(rasterId);
     }
 
-    // Cleanup pair registry (but keep AOI layer tracking refs)
+    // Update pair mapping (remove all rasters for this AOI)
+    pairByAoiId.current.delete(aoiId);
     pairsRef.current.delete(aoiId);
+    
+    // Clear active raster for this AOI
+    activeRasterByAoiId.current.delete(aoiId);
+    
+    // Clear rasterIdsByAoiId
+    rasterIdsByAoiId.current.delete(aoiId);
 
-    // Remove raster from React state (createdRasters array)
-    // This prevents the old overlay from reappearing
+    // Remove rasters from React state
     if (onRemoveRasterByAoiId && aoiId) {
-      console.log(`[LayerGroupManager] removeOverlayForAoiId: Calling onRemoveRasterByAoiId(${aoiId}) to remove raster from React state`);
       onRemoveRasterByAoiId(aoiId);
-    } else if (onRemoveRaster && createdRasterId) {
-      console.log(`[LayerGroupManager] removeOverlayForAoiId: Calling onRemoveRaster(${createdRasterId}) to remove raster from React state`);
-      onRemoveRaster(createdRasterId);
+    } else if (onRemoveRaster) {
+      rasterIds.forEach((rid) => onRemoveRaster(rid));
     }
 
     // IMPORTANT: We do NOT call onRemoveAoi here
@@ -563,77 +937,63 @@ export default function LayerGroupManager({
     // We do NOT clear AOI tracking refs
     // This allows regeneration with the same AOI
 
-    console.log(`[LayerGroupManager] removeOverlayForAoiId: ✅ Completed overlay removal (Raster: ${createdRasterId}, AOI: ${aoiId}) - AOI layer preserved`);
+    console.log(`[LayerGroupManager] removeOverlayForAoiId: ✅ Completed overlay removal (${rasterIds.length} raster(s), AOI: ${aoiId}) - AOI layer preserved`);
     return true; // Return success indicator
   }, [map, onRemoveRaster, onRemoveRasterByAoiId]);
 
+
   // ============================================================
-  // DELETE PAIR (USER INTENT - full delete)
+  // REMOVE AOI AND ALL RASTERS (USER INTENT - full delete)
   // ============================================================
-  // This function deletes BOTH the AOI layer and its paired raster overlay
+  // This function removes the AOI layer and ALL raster overlays for that AOI
   // It uses app-level stable IDs (aoi.id) for reliable pairing
   // Used when user explicitly deletes AOI (eraser tool, remove action)
-  // Calls onRemoveAoi to clear AOI state (userClip, aois array, etc.)
+  // Calls onRemoveAoi to clear AOI state and onRemoveRasterByAoiId to clear all rasters
   // ============================================================
-  const deletePairByAoiId = useCallback((aoiId) => {
+  const removeAoiAndAllRasters = useCallback((aoiId) => {
     if (!aoiId) {
-      console.warn("[LayerGroupManager] deletePairByAoiId: No aoiId provided");
+      console.warn("[LayerGroupManager] removeAoiAndAllRasters: No aoiId provided");
       return;
     }
 
-    // Find the pair using app-level aoiId
-    const pair = pairsRef.current.get(aoiId);
-    if (!pair) {
-      console.warn(`[LayerGroupManager] deletePairByAoiId: No pair found for aoiId: ${aoiId}`);
-      console.warn(`[LayerGroupManager] Available keys in pairsRef:`, Array.from(pairsRef.current.keys()));
-      return;
-    }
+    // Find the AOI layer using app-level aoiId
+    const aoiLayerInfo = aoiLayersById.current.get(aoiId);
+    const aoiLayer = aoiLayerInfo?.layer || aoiLayersRef.current.get(aoiId);
 
-    const { aoiLayer, overlayLayer, createdRasterId } = pair;
-
-    console.log(`[LayerGroupManager] deletePairByAoiId: Deleting pair (Raster: ${createdRasterId}, AOI: ${aoiId}) - FULL DELETE`);
+    console.log(`[LayerGroupManager] removeAoiAndAllRasters: Removing AOI ${aoiId} and ALL linked overlays - FULL DELETE`);
 
     // NEVER delete base AOI - check for locked flag
     if (aoiLayer?.__locked || aoiLayer?.options?.__locked || aoiLayer === baseAoiLayerRef.current) {
-      console.log("[LayerGroupManager] deletePairByAoiId: Blocked deletion of locked AOI (base AOI)");
+      console.log("[LayerGroupManager] removeAoiAndAllRasters: Blocked deletion of locked AOI (base AOI)");
       return;
     }
 
-    // Remove overlay from map
-    if (overlayLayer) {
-      try {
-        if (overlayLayerGroupRef.current?.hasLayer(overlayLayer)) {
-          overlayLayerGroupRef.current.removeLayer(overlayLayer);
-        }
-        if (map.hasLayer && map.hasLayer(overlayLayer)) {
-          map.removeLayer(overlayLayer);
-        }
-        console.log(`[LayerGroupManager] deletePairByAoiId: Removed overlay layer from map`);
-      } catch (err) {
-        console.warn(`[LayerGroupManager] Error removing overlay:`, err);
-      }
-    }
+    // ✅ CRITICAL: Remove ALL rasters for this AOI FIRST (before removing AOI layer)
+    removeAllRastersForAoi(aoiId);
 
-    // Remove AOI from map
-    if (aoiLayer && map.hasLayer && map.hasLayer(aoiLayer)) {
+    // Remove AOI layer from map
+    if (aoiLayer) {
       try {
         // Remove from appropriate layer group
         if (uploadedAoiLayerGroupRef.current?.hasLayer(aoiLayer)) {
           uploadedAoiLayerGroupRef.current.removeLayer(aoiLayer);
         } else if (drawnAoiLayerGroupRef.current?.hasLayer(aoiLayer)) {
           drawnAoiLayerGroupRef.current.removeLayer(aoiLayer);
-        } else {
+        } else if (map.hasLayer && map.hasLayer(aoiLayer)) {
           map.removeLayer(aoiLayer);
         }
-        console.log(`[LayerGroupManager] deletePairByAoiId: Removed AOI layer from map`);
+        console.log(`[LayerGroupManager] removeAoiAndAllRasters: Removed AOI layer from map`);
       } catch (err) {
         console.warn(`[LayerGroupManager] Error removing AOI layer:`, err);
       }
     }
 
-    // Cleanup pair registry
+    // Cleanup all registries
     pairsRef.current.delete(aoiId);
-    pairByAoiId.current.delete(aoiId); // Also clean up split registry pair mapping
+    pairByAoiId.current.delete(aoiId);
+    activeRasterByAoiId.current.delete(aoiId);
+    aoiLayersById.current.delete(aoiId);
+    aoiLayersRef.current.delete(aoiId);
 
     // Cleanup tracking refs
     if (uploadedLayersRef.current.has(aoiId)) {
@@ -642,28 +1002,43 @@ export default function LayerGroupManager({
     if (drawnLayerRef.current === aoiLayer) {
       drawnLayerRef.current = null;
     }
-    aoiLayersRef.current.delete(aoiId); // Remove from legacy unified registry
-    aoiLayersById.current.delete(aoiId); // CRITICAL: Remove from split registry to prevent re-registration
 
-    // Remove raster from React state (createdRasters array)
+    // Remove ALL rasters for this AOI from React state
     if (onRemoveRasterByAoiId && aoiId) {
-      console.log(`[LayerGroupManager] deletePairByAoiId: Calling onRemoveRasterByAoiId(${aoiId}) to remove raster from React state`);
+      console.log(`[LayerGroupManager] removeAoiAndAllRasters: Calling onRemoveRasterByAoiId(${aoiId}) to remove ${rasterIds.length} raster(s) from React state`);
       onRemoveRasterByAoiId(aoiId);
-    } else if (onRemoveRaster && createdRasterId) {
-      console.log(`[LayerGroupManager] deletePairByAoiId: Calling onRemoveRaster(${createdRasterId}) to remove raster from React state`);
-      onRemoveRaster(createdRasterId);
     }
     
     // Remove AOI from React state (userClip, aois array, etc.)
-    // This is the key difference from removeOverlayForAoiId
     if (onRemoveAoi && aoiId) {
-      console.log(`[LayerGroupManager] deletePairByAoiId: Calling onRemoveAoi(${aoiId}) to remove AOI from React state`);
+      console.log(`[LayerGroupManager] removeAoiAndAllRasters: Calling onRemoveAoi(${aoiId}) to remove AOI from React state`);
       onRemoveAoi(aoiId);
     }
 
-    console.log(`[LayerGroupManager] deletePairByAoiId: ✅ Completed FULL deletion of pair (Raster: ${createdRasterId}, AOI: ${aoiId})`);
+    // ✅ LEAK DETECTION: Log registry state after removal
+    const remainingOverlays = overlayByRasterId.current.size;
+    const mapLayerCount = map._layers ? Object.keys(map._layers).length : 0;
+    let imageOverlayCount = 0;
+    if (map.eachLayer) {
+      map.eachLayer((layer) => {
+        if (layer instanceof L.ImageOverlay) {
+          imageOverlayCount++;
+        }
+      });
+    }
+    
+    console.log(`[LayerGroupManager] removeAoiAndAllRasters: ✅ Completed FULL deletion (AOI: ${aoiId})`);
+    console.log(`[LayerGroupManager] LEAK DETECTION: overlayByRasterId.size=${remainingOverlays}, map._layers=${mapLayerCount}, ImageOverlay layers=${imageOverlayCount}`);
+    
+    if (remainingOverlays === 0 && imageOverlayCount > 0) {
+      console.warn(`[LayerGroupManager] ⚠️ LEAK DETECTED: ${imageOverlayCount} ImageOverlay layer(s) still on map but not in registry!`);
+    }
+    
     return true; // Return success indicator
-  }, [map, onRemoveAoi, onRemoveRaster, onRemoveRasterByAoiId]);
+  }, [map, onRemoveAoi, onRemoveRasterByAoiId]);
+
+  // Legacy function name for backward compatibility
+  const deletePairByAoiId = removeAoiAndAllRasters;
 
   // Legacy function for backward compatibility (uses layer reference)
   const deletePairByAoiLayer = useCallback((aoiLayer) => {
@@ -682,7 +1057,7 @@ export default function LayerGroupManager({
       // Try to find aoiId from tracking refs
       for (const [id, layer] of uploadedLayersRef.current.entries()) {
         if (layer === aoiLayer) {
-          deletePairByAoiId(id);
+          removeAoiAndAllRasters(id);
           return;
         }
       }
@@ -697,8 +1072,8 @@ export default function LayerGroupManager({
     }
 
     // Use the app-level ID-based deletion
-    deletePairByAoiId(aoiId);
-  }, [deletePairByAoiId, onRemoveAoi]);
+    removeAoiAndAllRasters(aoiId);
+  }, [removeAoiAndAllRasters, onRemoveAoi]);
 
   // ============================================================
   // INITIALIZE PANES AND LAYER GROUPS (once on mount)
@@ -819,9 +1194,9 @@ export default function LayerGroupManager({
 
       console.log("[PAIR] erase", aoiId, layer._leaflet_id);
 
-      // Delete the pair using app-level aoiId
-      // This will remove both AOI and overlay, and update React state
-      deletePairByAoiId(aoiId);
+      // Remove AOI and ALL its rasters using app-level aoiId
+      // This will remove both AOI and all overlays, and update React state
+      removeAoiAndAllRasters(aoiId);
     };
 
     map.on("pm:remove", handlePmRemove);
@@ -829,7 +1204,7 @@ export default function LayerGroupManager({
     return () => {
       map.off("pm:remove", handlePmRemove);
     };
-  }, [map, deletePairByAoiId]);
+  }, [map, removeAoiAndAllRasters]);
 
   // ============================================================
   // HOOK 2: TRACK REMOVAL MODE AND HANDLE RASTER OVERLAY CLICKS
@@ -905,8 +1280,8 @@ export default function LayerGroupManager({
               rasterId: overlayLayer.__createdRasterId
             });
 
-            // Delete the pair using app-level aoiId
-            deletePairByAoiId(overlayAoiId);
+            // Remove AOI and ALL its rasters using app-level aoiId
+            removeAoiAndAllRasters(overlayAoiId);
             return; // Stop iterating after finding and deleting the pair
           }
         } catch (err) {
@@ -921,7 +1296,7 @@ export default function LayerGroupManager({
       map.off("pm:globalremovalmodetoggled", handleRemovalModeToggle);
       map.off("click", handleMapClick);
     };
-  }, [map, deletePairByAoiId]);
+  }, [map, removeAoiAndAllRasters]);
 
   // ============================================================
   // RENDER AOI_DISS (PERMANENT BASE AOI) - Added DIRECTLY to map
@@ -1017,8 +1392,8 @@ export default function LayerGroupManager({
           // Only delete if the specific ID is missing from a non-empty array (explicit removal)
           const isExplicitRemoval = uploadedAois.length > 0 || existingIds.size === 1;
           if (isExplicitRemoval) {
-            console.log(`[LayerGroupManager] Explicit removal of uploaded AOI ${id} - deleting pair`);
-            deletePairByAoiId(id);
+            console.log(`[LayerGroupManager] Explicit removal of uploaded AOI ${id} - removing AOI and all rasters`);
+            removeAoiAndAllRasters(id);
           } else {
             console.log(`[LayerGroupManager] Skipping removal of uploaded AOI ${id} - may be temporary re-render (array empty)`);
             // Don't delete - preserve the layer
@@ -1107,7 +1482,7 @@ export default function LayerGroupManager({
         console.log(`[LayerGroupManager] Added uploaded AOI layer: ${aoi.id}`);
       }
     });
-  }, [map, uploadedAois, deletePairByAoiId]);
+  }, [map, uploadedAois, removeAoiAndAllRasters]);
 
   // ============================================================
   // RENDER DRAWN AOI (in userAoiPane)
@@ -1156,25 +1531,41 @@ export default function LayerGroupManager({
     // Do NOT cleanup if drawnAoi is just temporarily null (could be export UI re-render)
     // Do NOT cleanup if geometry is the same (just a reference change)
     if (hasOldLayer && ((hasNewAoi && geometryActuallyChanged) || isExplicitRemoval)) {
-      const oldAoiId = drawnLayerRef.current.__aoiId || drawnLayerRef.current.options?.__aoiId;
+      // ✅ DEFENSIVE: Use optional chaining to safely access oldAoiId
+      const oldAoiId = drawnLayerRef.current?.__aoiId || drawnLayerRef.current?.options?.__aoiId;
       if (oldAoiId) {
+        // ✅ DEFENSIVE: Check if there are any rasters for this AOI before attempting removal
+        const oldRasterIds = rasterIdsByAoiId.current.get(oldAoiId);
+        const hasRasters = oldRasterIds && oldRasterIds.size > 0;
+        
         // Only delete pair if we have a new AOI with different geometry (replacing) or it's an explicit removal
-        // For explicit removal, deletePairByAoiId will handle full cleanup
+        // For explicit removal, removeAoiAndAllRasters will handle full cleanup
         if (hasNewAoi && geometryActuallyChanged) {
-          // Replacing with new AOI with different geometry - use removeOverlayForAoiId to keep AOI, just remove old overlay
-          console.log(`[LayerGroupManager] Replacing drawn AOI ${oldAoiId} with new geometry - removing old overlay only`);
-          removeOverlayForAoiId(oldAoiId);
+          // Replacing with new AOI with different geometry - remove old overlays only (keep AOI for now, but "only one AOI" mode will clear it)
+          console.log(`[LayerGroupManager] Replacing drawn AOI ${oldAoiId} with new geometry - removing old overlays`);
+          
+          if (hasRasters) {
+            // Use removeAllRastersForAoi to properly clean up all overlays and registries
+            removeAllRastersForAoi(oldAoiId);
+          } else {
+            console.log(`[LayerGroupManager] No rasters found for old AOI ${oldAoiId}, skipping overlay removal`);
+          }
         } else if (isExplicitRemoval) {
           // Explicit removal - full delete
-          console.log(`[LayerGroupManager] Explicit removal of drawn AOI ${oldAoiId} - full delete`);
-          deletePairByAoiId(oldAoiId);
+          console.log(`[LayerGroupManager] Explicit removal of drawn AOI ${oldAoiId} - removing AOI and all rasters`);
+          removeAoiAndAllRasters(oldAoiId);
           // Clear geometry hash for removed AOI
           geometryHashesRef.current.delete(oldAoiId);
         }
-        aoiLayersRef.current.delete(oldAoiId); // Remove from unified registry
+        
+        // Remove from unified registry
+        aoiLayersRef.current.delete(oldAoiId);
+        // Also remove from aoiLayersById
+        aoiLayersById.current.delete(oldAoiId);
       }
-      // Safe removal: check if layer exists and is valid before removing
-      if (drawnLayerRef.current && drawnAoiLayerGroupRef.current.hasLayer(drawnLayerRef.current)) {
+      
+      // ✅ DEFENSIVE: Safe removal - check if layer exists and is valid before removing
+      if (drawnLayerRef.current && drawnAoiLayerGroupRef.current?.hasLayer(drawnLayerRef.current)) {
         try {
           drawnAoiLayerGroupRef.current.removeLayer(drawnLayerRef.current);
         } catch (err) {
@@ -1269,7 +1660,7 @@ export default function LayerGroupManager({
     
     // Update previous ref for next comparison
     prevDrawnAoiRef.current = drawnAoi;
-  }, [map, drawnAoi, deletePairByAoiId, removeOverlayForAoiId, registerAoiLayer]);
+  }, [map, drawnAoi, removeAoiAndAllRasters, removeOverlayForAoiId, registerAoiLayer]);
 
   // ============================================================
   // RENDER RASTER OVERLAYS AND REGISTER PAIRS
@@ -1278,32 +1669,20 @@ export default function LayerGroupManager({
     console.log("[LayerGroupManager] 🔍 useEffect createdRasters triggered - count:", createdRasters?.length || 0);
     if (!map || !overlayLayerGroupRef.current) return;
 
-    const currentIds = new Set(createdRasters.map((r) => r.id));
+    const visibleIds = new Set(createdRasters.filter((r) => r.isVisible !== false).map((r) => r.id));
 
-    // Remove overlays that are no longer in createdRasters
-    // Cleanup pairs for removed rasters
-    // IMPORTANT: This automatically removes old overlays when createdRasters array is replaced
-    for (const [aoiId, pair] of pairsRef.current.entries()) {
-      if (!currentIds.has(pair.createdRasterId)) {
-        // Cleanup pair registry
-        pairsRef.current.delete(aoiId);
-        
-        // Remove overlay from map
-        if (pair.overlayLayer && overlayLayerGroupRef.current.hasLayer(pair.overlayLayer)) {
-          overlayLayerGroupRef.current.removeLayer(pair.overlayLayer);
-          map.removeLayer(pair.overlayLayer);
-        }
-        console.log(`[LayerGroupManager] Removed raster overlay pair: ${pair.createdRasterId}`);
+    // Remove overlays that are no longer present or not visible
+    // ✅ CRITICAL: Use overlayByRasterId (PRIMARY REGISTRY)
+    const rasterIdsToRemove = [];
+    for (const rasterId of overlayByRasterId.current.keys()) {
+      if (!visibleIds.has(rasterId)) {
+        rasterIdsToRemove.push(rasterId);
       }
     }
     
-    // ✅ CRITICAL: LayerGroupManager is a pure renderer - it should NEVER clear overlays
-    // based on createdRasters being empty. MapExplorer controls state, LayerGroupManager just renders.
-    // If createdRasters is empty, just render nothing (do NOT clear existing overlays)
-    if (createdRasters.length === 0) {
-      // Do NOT clear overlays - just don't render new ones
-      // MapExplorer controls overlay lifecycle, not LayerGroupManager
-      return; // Early return - preserve existing overlays
+    // Remove each overlay using removeRasterOverlay (which handles all cleanup)
+    for (const rasterId of rasterIdsToRemove) {
+      removeRasterOverlay(rasterId);
     }
 
     // Add new overlays and register pairs
@@ -1314,24 +1693,20 @@ export default function LayerGroupManager({
         continue;
       }
 
-      // ✅ CRITICAL: Only replace overlay if we're actually regenerating with a NEW raster
-      // Do NOT replace on UI re-renders (export, histogram, stats clicks)
+      if (raster.isVisible === false) {
+        continue; // respect hidden state
+      }
+      
       const rasterAoiId = raster.aoiId;
-      if (rasterAoiId && pairsRef.current.has(rasterAoiId)) {
-        const existingPair = pairsRef.current.get(rasterAoiId);
-        const existingRasterId = existingPair?.createdRasterId;
-        
-        // Only replace if the raster ID is DIFFERENT (actual regeneration)
-        // If it's the same raster ID, this is just a re-render, don't remove it
-        if (existingRasterId && existingRasterId !== raster.id) {
-          // Remove old overlay but keep AOI layer (for regeneration with new raster)
-          // Use removeOverlayForAoiId (system delete) instead of deletePairByAoiId (user delete)
-          console.log(`[LayerGroupManager] Replacing overlay for AOI ${rasterAoiId} (regenerating with new raster: ${existingRasterId} -> ${raster.id})`);
-          removeOverlayForAoiId(rasterAoiId);
-        } else {
-          // Same raster ID - this is just a re-render, skip it
-          console.log(`[LayerGroupManager] Skipping overlay replacement - same raster ID (${raster.id}), likely UI re-render`);
-          continue; // Skip to next raster
+      
+      // ✅ CRITICAL GUARD: Do NOT re-add overlay if AOI no longer exists
+      // This prevents rehydration of overlays for deleted AOIs when drawing starts
+      if (rasterAoiId) {
+        // Check both registries (aoiLayersById is primary, aoiLayersRef is legacy)
+        const aoiExists = aoiLayersById.current.has(rasterAoiId) || aoiLayersRef.current.has(rasterAoiId);
+        if (!aoiExists) {
+          console.log(`[LayerGroupManager] ⚠️ Skipping raster ${raster.id}: AOI ${rasterAoiId} no longer exists (deleted) - preventing rehydration`);
+          continue; // Do NOT re-add overlay for deleted AOI
         }
       }
 
@@ -1383,31 +1758,192 @@ export default function LayerGroupManager({
         continue;
       }
 
-      const overlay = L.imageOverlay(fullUrl, leafletBounds, {
+      // ✅ CRITICAL: Use registerRasterOverlay - THE ONLY WAY TO CREATE OVERLAYS
+      const aoiId = rasterAoiId;
+      const overlay = registerRasterOverlay({
+        rasterId: raster.id,
+        aoiId: aoiId,
+        overlayUrl: fullUrl,
+        bounds: leafletBounds,
         opacity: 1.0,
-        interactive: false, // Must NOT block clicks (eraser needs to work)
-        pane: "rasterPane", // Below AOI layers
-        className: "raster-overlay-pixelated",
       });
 
-      overlay.options.__overlayId = raster.id;
-      overlay._pmIgnore = true;
-      overlay.__bounds = leafletBounds; // Store bounds for erase-by-click
+      if (!overlay) {
+        console.warn(`[LayerGroupManager] Failed to register overlay for raster ${raster.id}`);
+        continue;
+      }
 
-      overlayLayerGroupRef.current.addLayer(overlay);
-
-      // Register overlay using helper function
-      // ✅ CRITICAL: Correct parameter order: (aoiId, rasterId, overlayLayer, bounds)
-      const aoiId = rasterAoiId;
+      // Also register in legacy setRasterOverlayForAoi for backward compatibility
       if (aoiId) {
         setRasterOverlayForAoi(aoiId, raster.id, overlay, leafletBounds);
+        
+        // Determine if this overlay should be shown
+        const activeRasterId = activeRasterByAoiId.current.get(aoiId);
+        const rasterSet = rasterIdsByAoiId.current.get(aoiId);
+        const isFirstRaster = !rasterSet || rasterSet.size === 1;
+        
+        if (activeRasterId === raster.id) {
+          // This is the active raster - show it
+          overlay.setOpacity(1.0);
+          overlay._hidden = false;
+        } else if (!activeRasterId && isFirstRaster) {
+          // No active raster yet and this is the first one - show it by default
+          overlay.setOpacity(1.0);
+          overlay._hidden = false;
+          activeRasterByAoiId.current.set(aoiId, raster.id);
+        } else {
+          // Another raster is active or this isn't the first - hide this one
+          overlay.setOpacity(0);
+          overlay._hidden = true;
+        }
       } else {
         console.warn(`[LayerGroupManager] ⚠️ Could not register overlay for raster ${raster.id}: missing aoiId`);
+        // Still show it if no aoiId (legacy support)
+        overlay.setOpacity(1.0);
+        overlay._hidden = false;
       }
     }
   }, [map, createdRasters, registerOverlay, removeOverlayForAoiId]);
 
-  // Expose layer groups and clearPmTempLayers via map instance (for external access if needed)
+
+  // ============================================================
+  // RASTER OVERLAY MANAGEMENT METHODS (EXPOSED VIA MAP INSTANCE)
+  // ============================================================
+  // These methods allow external components to control raster overlays
+  // by rasterId, independent of AOI management
+  // ============================================================
+  
+  /**
+   * Add a raster overlay to the map (uses registerRasterOverlay)
+   * @param {Object} params - { rasterId, aoiId, overlayUrl, bounds }
+   */
+  const addRasterOverlay = useCallback(({ rasterId, aoiId, overlayUrl, bounds }) => {
+    if (!map || !overlayLayerGroupRef.current) {
+      console.warn("[LayerGroupManager] addRasterOverlay: Map or overlay group not available");
+      return;
+    }
+
+    // Use registerRasterOverlay to create the overlay
+    const overlay = registerRasterOverlay({ rasterId, aoiId, overlayUrl, bounds, opacity: 0 });
+    if (overlay) {
+      overlay._hidden = true; // Mark as hidden by default
+    }
+  }, []);
+
+  /**
+   * Show a raster overlay on the map
+   * @param {string} rasterId - The raster ID to show
+   */
+  const showRasterOverlay = useCallback((rasterId) => {
+    if (!map || !overlayLayerGroupRef.current) {
+      console.warn("[LayerGroupManager] showRasterOverlay: Map or overlay group not available");
+      return;
+    }
+
+    // ✅ CRITICAL: Use overlayByRasterId (PRIMARY REGISTRY)
+    const overlay = overlayByRasterId.current.get(rasterId);
+    if (!overlay) {
+      console.warn(`[LayerGroupManager] showRasterOverlay: Overlay ${rasterId} not found`);
+      return;
+    }
+
+    const overlayInfo = rasterOverlaysByRasterId.current.get(rasterId);
+    const aoiId = overlayInfo?.aoiId;
+
+    // Hide other overlays for the same AOI (if we want only one visible per AOI)
+    if (aoiId) {
+      // ✅ CRITICAL: Use rasterIdsByAoiId (PRIMARY REGISTRY)
+      const rasterSet = rasterIdsByAoiId.current.get(aoiId);
+      if (rasterSet) {
+        rasterSet.forEach((otherRasterId) => {
+          if (otherRasterId !== rasterId) {
+            const otherOverlay = overlayByRasterId.current.get(otherRasterId);
+            if (otherOverlay) {
+              otherOverlay.setOpacity(0);
+              otherOverlay._hidden = true;
+            }
+          }
+        });
+      }
+      // Update active raster for this AOI
+      activeRasterByAoiId.current.set(aoiId, rasterId);
+    }
+
+    // Show this overlay
+    overlay.setOpacity(1.0);
+    overlay._hidden = false;
+
+    // Ensure it's in the layer group
+    if (!overlayLayerGroupRef.current.hasLayer(overlay)) {
+      overlayLayerGroupRef.current.addLayer(overlay);
+    }
+
+    console.log(`[LayerGroupManager] ✅ Showed raster overlay: rasterId=${rasterId}, aoiId=${aoiId}`);
+  }, [map]);
+
+  /**
+   * Hide a raster overlay (but keep it in the registry)
+   * @param {string} rasterId - The raster ID to hide
+   */
+  const hideRasterOverlay = useCallback((rasterId) => {
+    if (!map || !overlayLayerGroupRef.current) {
+      console.warn("[LayerGroupManager] hideRasterOverlay: Map or overlay group not available");
+      return;
+    }
+
+    // ✅ CRITICAL: Use overlayByRasterId (PRIMARY REGISTRY)
+    const overlay = overlayByRasterId.current.get(rasterId);
+    if (!overlay) {
+      console.warn(`[LayerGroupManager] hideRasterOverlay: Overlay ${rasterId} not found`);
+      return;
+    }
+
+    overlay.setOpacity(0);
+    overlay._hidden = true;
+
+    // Clear active raster for this AOI if it was active
+    const overlayInfo = rasterOverlaysByRasterId.current.get(rasterId);
+    const aoiId = overlayInfo?.aoiId;
+    if (aoiId && activeRasterByAoiId.current.get(aoiId) === rasterId) {
+      activeRasterByAoiId.current.delete(aoiId);
+    }
+
+    console.log(`[LayerGroupManager] ✅ Hid raster overlay: rasterId=${rasterId}`);
+  }, [map]);
+
+
+  /**
+   * Set the active raster for an AOI (hides others, shows this one)
+   * @param {string} aoiId - The AOI ID
+   * @param {string} rasterId - The raster ID to make active
+   */
+  const setActiveRasterForAoi = useCallback((aoiId, rasterId) => {
+    if (!aoiId || !rasterId) {
+      console.warn("[LayerGroupManager] setActiveRasterForAoi: Missing aoiId or rasterId");
+      return;
+    }
+
+    // Hide all rasters for this AOI
+    const rasterSet = rasterIdsByAoiId.current.get(aoiId);
+    if (rasterSet) {
+      rasterSet.forEach((otherRasterId) => {
+        if (otherRasterId !== rasterId) {
+          hideRasterOverlay(otherRasterId);
+        }
+      });
+    }
+
+    // Show the selected raster
+    showRasterOverlay(rasterId);
+
+    // Update active raster tracking
+    activeRasterByAoiId.current.set(aoiId, rasterId);
+
+    console.log(`[LayerGroupManager] ✅ Set active raster for AOI: aoiId=${aoiId}, rasterId=${rasterId}`);
+  }, [showRasterOverlay, hideRasterOverlay]);
+
+
+  // Expose layer groups and methods via map instance (for external access if needed)
   useEffect(() => {
     if (map) {
       map._layerGroups = {
@@ -1419,8 +1955,23 @@ export default function LayerGroupManager({
       map._clearPmTempLayers = clearPmTempLayers;
       // Also keep old name for backward compatibility
       map._clearGeomanTempLayers = clearPmTempLayers;
+      
+      // Expose raster overlay management methods
+      // Note: registerRasterOverlay, removeRasterOverlay, removeAllRastersForAoi, clearAll are hoisted function declarations
+      // addRasterOverlay, showRasterOverlay, hideRasterOverlay, setActiveRasterForAoi are useCallbacks
+      map._layerGroupManager = {
+        registerRasterOverlay,
+        addRasterOverlay,
+        showRasterOverlay,
+        hideRasterOverlay,
+        removeRasterOverlay,
+        removeAllRastersForAoi,
+        setActiveRasterForAoi,
+        removeAoiAndAllRasters,
+        clearAll,
+      };
     }
-  }, [map, clearPmTempLayers]);
+  }, [map, clearPmTempLayers, addRasterOverlay, showRasterOverlay, hideRasterOverlay, setActiveRasterForAoi, removeAoiAndAllRasters]);
 
   return null; // This component doesn't render anything
 }

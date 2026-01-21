@@ -65,7 +65,7 @@ function LegendBar({ ramp }) {
 }
 
 // Individual raster item component
-function RasterItem({ raster, isActive, onShow, onRemove }) {
+function RasterItem({ raster, isActive, onShow, onToggleVisibility, onRemove }) {
   const createdTime = new Date(raster.createdAt);
   const timeStr = createdTime.toLocaleTimeString([], {
     hour: "2-digit",
@@ -95,16 +95,20 @@ function RasterItem({ raster, isActive, onShow, onRemove }) {
       }}
     >
       {/* Name */}
-      <div
-        style={{
-          fontSize: "13px",
-          fontWeight: 600,
-          color: "#111827",
-          marginBottom: "8px",
-          wordBreak: "break-word",
-        }}
-      >
-        {raster.name}
+      <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: "8px" }}>
+        <div
+          style={{
+            fontSize: "13px",
+            fontWeight: 600,
+            color: "#111827",
+            wordBreak: "break-word",
+          }}
+        >
+          {raster.label || raster.name}
+        </div>
+        <div style={{ fontSize: 11, color: "#6b7280" }}>
+          {raster.name}
+        </div>
       </div>
 
       {/* PNG Thumbnail with checkerboard background */}
@@ -152,7 +156,7 @@ function RasterItem({ raster, isActive, onShow, onRemove }) {
           {dateStr} {timeStr}
         </div>
 
-        <div style={{ display: "flex", gap: "6px" }}>
+        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
           <button
             onClick={onShow}
             style={{
@@ -168,6 +172,21 @@ function RasterItem({ raster, isActive, onShow, onRemove }) {
             disabled={isActive}
           >
             {isActive ? "Active" : "Show"}
+          </button>
+          <button
+            onClick={onToggleVisibility}
+            style={{
+              padding: "4px 10px",
+              fontSize: "11px",
+              background: raster.isVisible ? "#10b981" : "#f3f4f6",
+              color: raster.isVisible ? "#ffffff" : "#374151",
+              border: "none",
+              borderRadius: "3px",
+              cursor: "pointer",
+              fontWeight: 500,
+            }}
+          >
+            {raster.isVisible ? "Hide" : "Show"}
           </button>
           <button
             onClick={onRemove}
@@ -195,6 +214,7 @@ export default function CreatedRastersList({
   rasters = [],
   activeRasterId = null,
   onShowRaster,
+  onToggleVisibility,
   onRemoveRaster,
   onClearAll = null,
 }) {
@@ -259,14 +279,31 @@ export default function CreatedRastersList({
         )}
       </div>
 
-      {rasters.map((raster) => (
-        <RasterItem
-          key={raster.id}
-          raster={raster}
-          isActive={raster.id === activeRasterId}
-          onShow={() => onShowRaster(raster.id)}
-          onRemove={() => onRemoveRaster(raster.id)}
-        />
+      {Object.values(
+        rasters.reduce((acc, r) => {
+          const key = r.aoiId || "unknown";
+          if (!acc[key]) {
+            acc[key] = { aoiId: key, aoiName: r.aoiName || `AOI ${key}`, items: [] };
+          }
+          acc[key].items.push(r);
+          return acc;
+        }, {})
+      ).map((group) => (
+        <div key={group.aoiId} style={{ marginBottom: "14px" }}>
+          <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8, color: "#111827" }}>
+            {group.aoiName}
+          </div>
+          {group.items.map((raster) => (
+            <RasterItem
+              key={raster.id}
+              raster={raster}
+              isActive={raster.id === activeRasterId}
+              onShow={() => onShowRaster(raster.id)}
+              onToggleVisibility={() => onToggleVisibility?.(raster.id)}
+              onRemove={() => onRemoveRaster(raster.id)}
+            />
+          ))}
+        </div>
       ))}
     </div>
   );

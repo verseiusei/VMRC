@@ -7,6 +7,8 @@ from pathlib import Path
 import rasterio
 from rasterio.mask import mask
 from rasterio.warp import transform_geom
+from rasterio.windows import from_bounds, Window
+from rasterio.features import geometry_mask
 from shapely.geometry import shape, mapping, Polygon, MultiPolygon
 from shapely.validation import make_valid
 from shapely.ops import unary_union
@@ -112,6 +114,288 @@ def expand_condition(condition: str) -> str:
     elif cond_upper == "N" or cond_upper == "NORMAL":
         return "Normal"
     return str(condition).title()
+
+
+def get_stress_display_name(stress_code: str) -> str:
+    """Convert stress code to display name."""
+    stress_map = {
+        "l": "Low Stress",
+        "ml": "Medium-Low Stress",
+        "m": "Medium Stress",
+        "mh": "Medium-High Stress",
+        "h": "High Stress",
+        "vh": "Very High Stress"
+    }
+    return stress_map.get(stress_code.lower(), stress_code)
+
+
+def get_month_name(month_code: str) -> str:
+    """Convert month code (04-09) to month name."""
+    month_map = {
+        "04": "April",
+        "05": "May",
+        "06": "June",
+        "07": "July",
+        "08": "August",
+        "09": "September"
+    }
+    return month_map.get(month_code, f"Month {month_code}")
+
+
+def get_raster_base_filename(raster_layer_id: int) -> str:
+    """
+    Get the base filename from the actual raster file (matches Raster Overview).
+    
+    Extracts the filename from the raster path and strips the extension.
+    Example: "HSL2.5_DF_50_D_l.tif" -> "HSL2.5_DF_50_D_l"
+    
+    Args:
+        raster_layer_id: ID of the raster layer
+    
+    Returns:
+        Sanitized base filename (without extension)
+    """
+    try:
+        raster_path = resolve_raster_path(raster_layer_id)
+        raster_filename = Path(raster_path).name
+        # Strip extension (e.g., "HSL2.5_DF_50_D_l.tif" -> "HSL2.5_DF_50_D_l")
+        base_name = Path(raster_filename).stem
+        print(f"[EXPORT FILENAME] Raster path: {raster_path}")
+        print(f"[EXPORT FILENAME] Raster filename: {raster_filename}")
+        print(f"[EXPORT FILENAME] Base name (no extension): {base_name}")
+        # Sanitize for Windows (remove spaces, slashes, colons) but preserve structure
+        sanitized = sanitize_filename(base_name)
+        return sanitized
+    except Exception as e:
+        print(f"[EXPORT FILENAME] Warning: Could not get raster filename: {e}")
+        return generate_default_filename()
+
+
+def build_export_filename(context: Optional[Dict[str, Any]], extension: str = "") -> str:
+    """
+    Build export filename from context filters with specific rules:
+    
+    Pattern: ${mapTypeCode}_${speciesCode}_${conditionCode}_Cover${cover}${classPart}${monthPart}
+    
+    Rules:
+    - If mapType === "HSL" -> DO NOT include month
+    - If species === "WH" -> DO NOT include class
+    
+    Args:
+        context: Dictionary with mapType, species, condition, month, coverPercent, hslClass
+        extension: File extension (e.g., ".pdf", ".png", ".tif") - will be added if not empty
+    
+    Returns:
+        Sanitized filename string
+    """
+    if not context:
+        return generate_default_filename() + extension
+    
+    # Extract and normalize values
+    map_type = str(context.get("mapType", "")).upper()
+    species = context.get("species", "")
+    condition = context.get("condition", "")
+    hsl_condition = context.get("hslCondition", "")
+    month = context.get("month")
+    cover_percent = context.get("coverPercent")
+    hsl_class = context.get("hslClass")
+    
+    # Debug: Log all input values
+    print(f"[EXPORT FILENAME] Input filters:")
+    print(f"  mapType: {map_type}")
+    print(f"  species: {species}")
+    print(f"  condition: {condition}")
+    print(f"  hslCondition: {hsl_condition}")
+    print(f"  month: {month}")
+    print(f"  coverPercent: {cover_percent}")
+    print(f"  hslClass: {hsl_class}")
+    
+    filename_parts = []
+    
+    # 1. Map type code
+    if map_type == "HSL" or map_type == "HIGH STRESS LEVEL":
+        map_type_code = "HSL"
+    elif map_type == "MORTALITY":
+        map_type_code = "MORTALITY"
+    elif map_type:
+        map_type_code = map_type
+    else:
+        map_type_code = None
+    
+    if map_type_code:
+        filename_parts.append(map_type_code)
+    
+    # 2. Species code
+    species_code = None
+    if species:
+        if species == "Douglas-fir":
+            species_code = "DF"
+        elif species == "Western Hemlock":
+            species_code = "WH"
+        else:
+            # Use first 2-3 letters of species name
+            species_code = species.replace(" ", "").replace("-", "")[:3].upper()
+    
+    if species_code:
+        filename_parts.append(species_code)
+    
+    # 3. Condition code (use full names: DRY/WET/NORMAL for consistency)
+    condition_code = None
+    if map_type == "HSL" and hsl_condition:
+        # Map HSL condition codes to full names
+        cond_map = {"D": "DRY", "W": "WET", "N": "NORMAL", "DRY": "DRY", "WET": "WET", "NORMAL": "NORMAL"}
+        condition_code = cond_map.get(str(hsl_condition).upper(), "DRY")  # Default to DRY if unknown
+    elif condition:
+        # Mortality uses full condition names
+        condition_upper = str(condition).upper()
+        if condition_upper in ["DRY", "D"]:
+            condition_code = "DRY"
+        elif condition_upper in ["WET", "W"]:
+            condition_code = "WET"
+        elif condition_upper in ["NORMAL", "N"]:
+            condition_code = "NORMAL"
+        else:
+            condition_code = condition_upper[:4]
+    
+    if condition_code:
+        filename_parts.append(condition_code)
+    
+    # 4. Cover percent
+    if cover_percent:
+        filename_parts.append(f"Cover{cover_percent}")
+    
+    # 5. Class part (ONLY if species !== "WH" and class is present)
+    class_part = ""
+    if species_code != "WH" and hsl_class:
+        # Map class codes to standard format
+        class_map = {
+            "l": "ClassI", "L": "ClassI",
+            "ml": "ClassII", "ML": "ClassII",
+            "m": "ClassIII", "M": "ClassIII",
+            "mh": "ClassIV", "MH": "ClassIV",
+            "h": "ClassV", "H": "ClassV",
+            "vh": "ClassVI", "VH": "ClassVI"
+        }
+        class_code = class_map.get(str(hsl_class), f"Class{hsl_class}")
+        class_part = f"_{class_code}"
+    
+    # 6. Month part (ONLY if mapType !== "HSL" and month is present)
+    month_part = ""
+    if map_type != "HSL" and month:
+        month_str = str(month)
+        # Format as M04, M05, etc. (zero-padded 2 digits)
+        if month_str.isdigit():
+            month_code = f"M{month_str.zfill(2)}"
+        else:
+            month_code = f"M{month_str}"
+        month_part = f"_{month_code}"
+    
+    # Build base filename
+    base_name = "_".join(filename_parts) + class_part + month_part
+    
+    if not base_name or base_name == class_part + month_part:
+        base_name = generate_default_filename()
+    
+    # Debug: Log computed parts
+    print(f"[EXPORT FILENAME] Computed parts:")
+    print(f"  mapTypeCode: {map_type_code}")
+    print(f"  speciesCode: {species_code}")
+    print(f"  conditionCode: {condition_code}")
+    print(f"  cover: Cover{cover_percent if cover_percent else 'N/A'}")
+    print(f"  classPart: {class_part if class_part else '(omitted - species is WH)' if species_code == 'WH' else '(omitted - no class)'}")
+    print(f"  monthPart: {month_part if month_part else '(omitted - mapType is HSL)' if map_type == 'HSL' else '(omitted - no month)'}")
+    print(f"[EXPORT FILENAME] Final base name: {base_name}")
+    
+    # Sanitize and add extension
+    sanitized = sanitize_filename(base_name)
+    if extension and not sanitized.endswith(extension):
+        sanitized += extension
+    
+    return sanitized
+
+
+def build_human_readable_raster_label(context: Optional[Dict[str, Any]]) -> str:
+    """
+    Build human-readable raster label from context.
+    Format: High Stress Level – {Species} – {Condition} – Month {MM} – Cover {XX}% – Class {I/II/etc}
+    """
+    if not context:
+        return "Raster"
+    
+    parts = []
+    
+    # Map Type
+    map_type = context.get("mapType", "")
+    if map_type == "hsl":
+        parts.append("High Stress Level")
+    elif map_type == "mortality":
+        parts.append("Mortality")
+    
+    # Species
+    species = context.get("species", "")
+    if species:
+        parts.append(species)
+    
+    # Condition
+    condition = context.get("condition", "")
+    hsl_condition = context.get("hslCondition", "")
+    if map_type == "hsl" and hsl_condition:
+        cond_map = {"D": "Dry", "W": "Wet", "N": "Normal"}
+        parts.append(cond_map.get(hsl_condition, hsl_condition))
+    elif condition:
+        parts.append(condition)
+    
+    # Month (for Mortality)
+    if map_type == "mortality":
+        month = context.get("month", "")
+        if month:
+            parts.append(get_month_name(month))
+    
+    # Stress Level / Class
+    df_stress = context.get("dfStress", "")
+    hsl_class = context.get("hslClass", "")
+    if map_type == "mortality" and df_stress:
+        # Extract stress code from dfStress (e.g., "Low Stress" -> "l")
+        stress_code = ""
+        if "Low Stress" in df_stress:
+            stress_code = "l"
+        elif "Medium-Low Stress" in df_stress:
+            stress_code = "ml"
+        elif "Medium Stress" in df_stress:
+            stress_code = "m"
+        elif "Medium-High Stress" in df_stress:
+            stress_code = "mh"
+        elif "High Stress" in df_stress:
+            stress_code = "h"
+        elif "Very High Stress" in df_stress:
+            stress_code = "vh"
+        if stress_code:
+            parts.append(get_stress_display_name(stress_code))
+    elif map_type == "hsl" and hsl_class:
+        parts.append(get_stress_display_name(hsl_class))
+    
+    # Cover Percent
+    cover_percent = context.get("coverPercent", "")
+    if cover_percent:
+        parts.append(f"Cover {cover_percent}%")
+    
+    # Class (for HSL)
+    if map_type == "hsl" and hsl_class:
+        # Map class codes to Roman numerals or class names
+        class_map = {
+            "l": "Class I",
+            "ml": "Class II",
+            "m": "Class III",
+            "mh": "Class IV",
+            "h": "Class V",
+            "vh": "Class VI"
+        }
+        class_label = class_map.get(hsl_class.lower(), f"Class {hsl_class}")
+        # Only add if not already added as stress level
+        if not any("Class" in p for p in parts):
+            parts.append(class_label)
+    
+    return " – ".join(parts) if parts else "Raster"
 
 
 def get_histogram_bin_ranges() -> List[str]:
@@ -715,50 +999,51 @@ def build_pdf_report_landscape(
     
     # Create PDF document in landscape orientation
     landscape_size = landscape(letter)  # 11" x 8.5"
+    
+    # Header callbacks - apply header on every page
+    def on_first_page_landscape(canvas, doc):
+        """Add header on first page."""
+        print("[PDF LANDSCAPE] 🔵 on_first_page callback triggered")
+        draw_pdf_header(canvas, doc, landscape_size)
+        print("[PDF LANDSCAPE] 🔵 on_first_page callback complete")
+    
+    def on_later_pages_landscape(canvas, doc):
+        """Add header on subsequent pages."""
+        print("[PDF LANDSCAPE] 🔵 on_later_pages callback triggered")
+        draw_pdf_header(canvas, doc, landscape_size)
+        print("[PDF LANDSCAPE] 🔵 on_later_pages callback complete")
+    
+    # Calculate top margin: HEADER_H (60pt) + 20pt padding = 80pt
+    # This ensures body content starts BELOW the header and cannot cover it
+    HEADER_H = 60  # Header height in points
+    header_margin = (HEADER_H + 20) / 72.0 * inch  # Convert points to inches (72pt = 1 inch)
+    print(f"[PDF LANDSCAPE] Header margin: {header_margin} inches ({HEADER_H + 20} points)")
+    
     doc = SimpleDocTemplate(
         pdf_buffer,
         pagesize=landscape_size,
-        topMargin=0.5*inch,
+        topMargin=header_margin,  # CRITICAL: Content starts BELOW header (HEADER_H + 20pt)
         bottomMargin=0.5*inch,
         leftMargin=0.5*inch,
-        rightMargin=0.5*inch
+        rightMargin=0.5*inch,
+        onFirstPage=on_first_page_landscape,
+        onLaterPages=on_later_pages_landscape,
     )
     story = []
     styles = getSampleStyleSheet()
     
+    # Title already in header, skip duplicate in body
+    
     # ============================================================
-    # HEADER: Project name + Dataset info + Date
+    # METADATA SECTION: Export Date, Raster Label
     # ============================================================
-    header_style = ParagraphStyle(
-        'HeaderStyle',
-        parent=styles['Heading1'],
-        fontSize=20,
-        textColor=colors.HexColor('#111827'),
-        spaceAfter=10,
-        alignment=1,  # Center
-    )
+    # REMOVED: AOI line - do not show AOI in PDF
+    # Build human-readable raster label
+    raster_label = build_human_readable_raster_label(context)
     
-    story.append(Paragraph("<b>VMRC Portal - Export Report</b>", header_style))
-    story.append(Spacer(1, 0.1*inch))
-    
-    # Dataset title
-    title_style = ParagraphStyle(
-        'TitleStyle',
-        parent=styles['Heading2'],
-        fontSize=16,
-        textColor=colors.HexColor('#374151'),
-        spaceAfter=8,
-        alignment=1,  # Center
-    )
-    story.append(Paragraph(title, title_style))
-    
-    # AOI Name and Date
     info_data = []
-    if aoi_name:
-        info_data.append(["AOI:", aoi_name])
     info_data.append(["Export Date:", datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
-    if raster_name:
-        info_data.append(["Dataset:", raster_name])
+    info_data.append(["Raster:", raster_label])  # Use human-readable label, not filename
     
     if info_data:
         info_table = Table(info_data, colWidths=[1.5*inch, 4*inch])
@@ -850,13 +1135,18 @@ def build_pdf_report_landscape(
     
     legend_table = Table(legend_data, colWidths=[0.8*inch, 1.2*inch])
     legend_style = TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#374151')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2f3a4a')),  # Header background: #2f3a4a
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),  # Header text: white, bold
         ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 9),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-        ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),  # Font weight 700 (bold)
+        ('FONTSIZE', (0, 0), (-1, 0), 11),  # Header font size
+        ('FONTSIZE', (0, 1), (-1, -1), 9),  # Data rows keep original size
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),  # Header padding: 8px vertical
+        ('TOPPADDING', (0, 0), (-1, 0), 8),
+        ('LEFTPADDING', (0, 0), (-1, 0), 10),  # Header padding: 10px horizontal
+        ('RIGHTPADDING', (0, 0), (-1, 0), 10),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 4),  # Data row padding
+        ('TOPPADDING', (0, 1), (-1, -1), 4),
         ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
     ])
     # Add color backgrounds
@@ -882,15 +1172,20 @@ def build_pdf_report_landscape(
     
     stats_table = Table(stats_data, colWidths=[2*inch, 2.5*inch])
     stats_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#374151')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2f3a4a')),  # Header background: #2f3a4a
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),  # Header text: white, bold
         ('BACKGROUND', (0, 1), (0, -1), colors.HexColor('#f9fafb')),
-        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#111827')),
+        ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#111827')),  # Data rows only (not header)
         ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 10),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),  # Header font weight 700 (bold)
+        ('FONTSIZE', (0, 0), (-1, 0), 12),  # Header font size
+        ('FONTSIZE', (0, 1), (-1, -1), 10),  # Data rows keep original size
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),  # Header padding: 8px vertical
+        ('TOPPADDING', (0, 0), (-1, 0), 8),
+        ('LEFTPADDING', (0, 0), (-1, 0), 10),  # Header padding: 10px horizontal
+        ('RIGHTPADDING', (0, 0), (-1, 0), 10),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 6),  # Data row padding
+        ('TOPPADDING', (0, 1), (-1, -1), 6),
         ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
         ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
     ]))
@@ -939,7 +1234,9 @@ def build_pdf_report_landscape(
         story.append(footer_table)
     
     # Build PDF
+    print("[PDF LANDSCAPE] 🔵 About to call doc.build(story) - header callbacks will execute during build")
     doc.build(story)
+    print("[PDF LANDSCAPE] 🔵 doc.build(story) complete")
     
     # Get PDF bytes
     pdf_bytes = pdf_buffer.getvalue()
@@ -947,6 +1244,127 @@ def build_pdf_report_landscape(
     
     print(f"[PDF] ✓ Generated landscape PDF report ({len(pdf_bytes)} bytes)")
     return pdf_bytes
+
+
+def draw_pdf_header(canvas, doc, pagesize):
+    """
+    Draw PDF header with title, logos, and divider line.
+    Reusable function called on every page.
+    
+    CRITICAL: In ReportLab, (0,0) is at BOTTOM LEFT, Y increases upward.
+    To draw at top: use y = page_height - offset
+    
+    Args:
+        canvas: ReportLab canvas object
+        doc: Document object (not used but required for callback signature)
+        pagesize: Tuple of (width, height) in points
+    """
+    print("[PDF] 🔵 CALLING draw_pdf_header - START")
+    canvas.saveState()
+    
+    page_width, page_height = pagesize
+    HEADER_H = 60  # Header height in points
+    
+    # ReportLab: (0,0) is bottom-left, so top of page is at y = page_height
+    # Draw rectangle from top: y_start = page_height - HEADER_H, height = HEADER_H
+    
+    # VISIBLE TEST: Draw a top band rectangle so we can confirm it renders
+    # RGB(245, 245, 245) = light gray
+    canvas.setFillColorRGB(0.96, 0.96, 0.96)  # RGB(245,245,245) normalized to 0-1
+    canvas.rect(0, page_height - HEADER_H, page_width, HEADER_H, fill=1, stroke=0)
+    print(f"[PDF] ✓ Drew header background rectangle: x=0, y={page_height - HEADER_H}, w={page_width}, h={HEADER_H}")
+    
+    # Title: "VMRC Mortality Calculation" centered
+    # Position: 35 points from top = page_height - 35
+    canvas.setFont("Helvetica-Bold", 16)
+    canvas.setFillColorRGB(0.07, 0.07, 0.07)  # RGB(20,20,20) = dark gray
+    title_text = "VMRC Mortality Calculation"
+    title_width = canvas.stringWidth(title_text, "Helvetica-Bold", 16)
+    title_y = page_height - 35  # 35 points from top
+    title_x = (page_width - title_width) / 2  # Centered
+    canvas.drawString(title_x, title_y, title_text)
+    print(f"[PDF] ✓ Drew title: '{title_text}' at x={title_x:.1f}, y={title_y}")
+    
+    # Logos: 40px tall, keep aspect ratio
+    logo_height = 40
+    logo_margin = 0.5 * inch  # Margin from page edges
+    
+    # Get base directory (backend root)
+    base_dir = Path(__file__).parent.parent.parent.parent  # Go up from app/api/v1/routes_raster_export.py to backend root
+    
+    # OSU logo on LEFT (oregon.jpg in /public folder)
+    osu_logo_paths = [
+        base_dir.parent / "vmrc-portal-frontend" / "public" / "oregon.jpg",  # Primary: /public/oregon.jpg
+        base_dir / "static" / "logos" / "osu_logo.png",
+        base_dir / "static" / "logos" / "OSU_logo.png",
+        base_dir / "static" / "logos" / "osu.png",
+        base_dir / "static" / "osu_logo.png",
+    ]
+    osu_logo_path = None
+    for path in osu_logo_paths:
+        if path.exists():
+            osu_logo_path = path
+            break
+    
+    if osu_logo_path:
+        try:
+            from reportlab.lib.utils import ImageReader
+            osu_img = ImageReader(str(osu_logo_path))
+            # Get image dimensions
+            img_width, img_height_orig = osu_img.getSize()
+            # Calculate width maintaining aspect ratio
+            logo_width = logo_height * (img_width / img_height_orig) if img_height_orig > 0 else logo_height
+            logo_y = page_height - logo_height - 10  # 10px from top
+            canvas.drawImage(osu_img, logo_margin, logo_y, width=logo_width, height=logo_height, preserveAspectRatio=True)
+            print(f"[PDF] ✓ Loaded OSU logo from: {osu_logo_path}")
+        except Exception as e:
+            print(f"[PDF] Warning: Could not load OSU logo: {e}")
+    else:
+        print(f"[PDF] Info: OSU logo not found (checked {len(osu_logo_paths)} paths)")
+    
+    # VMRC logo on RIGHT (vmrc.png in /public folder)
+    vmrc_logo_paths = [
+        base_dir.parent / "vmrc-portal-frontend" / "public" / "vmrc.png",  # Primary: /public/vmrc.png
+        base_dir / "static" / "logos" / "vmrc_logo.png",
+        base_dir / "static" / "logos" / "VMRC_logo.png",
+        base_dir / "static" / "logos" / "vmrc.png",
+        base_dir / "static" / "vmrc.png",
+        Path("static/logos/vmrc_logo.png"),
+        Path("static/logos/vmrc.png"),
+        Path("static/vmrc.png"),
+    ]
+    vmrc_logo_path = None
+    for path in vmrc_logo_paths:
+        if path.exists():
+            vmrc_logo_path = path
+            break
+    
+    if vmrc_logo_path:
+        try:
+            from reportlab.lib.utils import ImageReader
+            vmrc_img = ImageReader(str(vmrc_logo_path))
+            # Get image dimensions
+            img_width, img_height_orig = vmrc_img.getSize()
+            # Calculate width maintaining aspect ratio
+            logo_width = logo_height * (img_width / img_height_orig) if img_height_orig > 0 else logo_height
+            logo_y = page_height - logo_height - 10  # 10px from top
+            logo_x = page_width - logo_width - logo_margin
+            canvas.drawImage(vmrc_img, logo_x, logo_y, width=logo_width, height=logo_height, preserveAspectRatio=True)
+            print(f"[PDF] ✓ Loaded VMRC logo from: {vmrc_logo_path}")
+        except Exception as e:
+            print(f"[PDF] Warning: Could not load VMRC logo: {e}")
+    else:
+        print(f"[PDF] Info: VMRC logo not found (checked {len(vmrc_logo_paths)} paths)")
+    
+    # Divider line at y = page_height - HEADER_H (bottom of header)
+    divider_y = page_height - HEADER_H
+    canvas.setStrokeColorRGB(0.82, 0.82, 0.82)  # RGB(180,180,180) = light gray
+    canvas.setLineWidth(1)
+    canvas.line(0, divider_y, page_width, divider_y)
+    print(f"[PDF] ✓ Drew divider line at y={divider_y} (from x=0 to x={page_width})")
+    
+    canvas.restoreState()
+    print("[PDF] 🔵 draw_pdf_header - COMPLETE")
 
 
 def build_pdf_report(
@@ -987,37 +1405,163 @@ def build_pdf_report(
     
     # Create PDF document in landscape orientation (better for maps)
     landscape_size = landscape(letter)  # 11" x 8.5"
+    
+    # Header callbacks - apply header on every page
+    def on_first_page(canvas, doc):
+        """Add header on first page."""
+        print("[PDF] 🔵 on_first_page callback triggered")
+        draw_pdf_header(canvas, doc, landscape_size)
+        print("[PDF] 🔵 on_first_page callback complete")
+    
+    def on_later_pages(canvas, doc):
+        """Add header on subsequent pages."""
+        print("[PDF] 🔵 on_later_pages callback triggered")
+        draw_pdf_header(canvas, doc, landscape_size)
+        print("[PDF] 🔵 on_later_pages callback complete")
+    
+    # Calculate top margin: HEADER_H (60pt) + 20pt padding = 80pt
+    # This ensures body content starts BELOW the header and cannot cover it
+    HEADER_H = 60  # Header height in points
+    header_margin = (HEADER_H + 20) / 72.0 * inch  # Convert points to inches (72pt = 1 inch)
+    print(f"[PDF] Header margin: {header_margin} inches ({HEADER_H + 20} points)")
+    
     doc = SimpleDocTemplate(
         pdf_buffer,
         pagesize=landscape_size,
-        topMargin=0.5*inch,
+        topMargin=header_margin,  # CRITICAL: Content starts BELOW header (HEADER_H + 20pt)
         bottomMargin=0.5*inch,
         leftMargin=0.5*inch,
-        rightMargin=0.5*inch
+        rightMargin=0.5*inch,
+        onFirstPage=on_first_page,
+        onLaterPages=on_later_pages,
     )
     story = []
     styles = getSampleStyleSheet()
     
     # ============================================================
-    # HEADER: Title + AOI name + timestamp
+    # PDF HEADER: Title + Logos (as first element in story)
+    # This ensures header appears on every page as part of content flow
     # ============================================================
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=20,
-        textColor=colors.HexColor('#111827'),
-        spaceAfter=15,
-        alignment=1,  # Center
-    )
-    story.append(Paragraph(title, title_style))
+    header_section = []
     
-    # AOI Name and Date
+    # Create header table with logos and title
+    # Get logo paths
+    base_dir = Path(__file__).parent.parent.parent.parent
+    osu_logo_path = None
+    vmrc_logo_path = None
+    
+    # Find OSU logo (oregon.jpg in /public folder)
+    osu_logo_paths = [
+        base_dir.parent / "vmrc-portal-frontend" / "public" / "oregon.jpg",  # Primary: /public/oregon.jpg
+        base_dir / "static" / "logos" / "osu_logo.png",
+        base_dir / "static" / "logos" / "OSU_logo.png",
+        base_dir / "static" / "logos" / "osu.png",
+        base_dir / "static" / "osu_logo.png",
+    ]
+    for path in osu_logo_paths:
+        if path.exists():
+            osu_logo_path = path
+            break
+    
+    # Find VMRC logo (vmrc.png in /public folder)
+    vmrc_logo_paths = [
+        base_dir.parent / "vmrc-portal-frontend" / "public" / "vmrc.png",  # Primary: /public/vmrc.png
+        base_dir / "static" / "logos" / "vmrc_logo.png",
+        base_dir / "static" / "logos" / "VMRC_logo.png",
+        base_dir / "static" / "logos" / "vmrc.png",
+        base_dir / "static" / "vmrc.png",
+        Path("static/logos/vmrc_logo.png"),
+        Path("static/logos/vmrc.png"),
+        Path("static/vmrc.png"),
+    ]
+    for path in vmrc_logo_paths:
+        if path.exists():
+            vmrc_logo_path = path
+            break
+    
+    # Build header row: [OSU Logo, Title, VMRC Logo]
+    header_cells = []
+    
+    # Left: OSU logo (or empty space)
+    if osu_logo_path:
+        try:
+            from PIL import Image as PILImage
+            osu_img_pil = PILImage.open(osu_logo_path)
+            osu_img_width, osu_img_height = osu_img_pil.size
+            logo_height_pt = 40  # 40px height (strict requirement)
+            logo_width_pt = logo_height_pt * (osu_img_width / osu_img_height) if osu_img_height > 0 else logo_height_pt
+            osu_img = Image(str(osu_logo_path), width=logo_width_pt, height=logo_height_pt)
+            header_cells.append(osu_img)
+            print(f"[PDF] ✓ Adding OSU logo to header from: {osu_logo_path}")
+        except Exception as e:
+            print(f"[PDF] Warning: Could not load OSU logo for header: {e}")
+            header_cells.append(Paragraph("", styles['Normal']))  # Empty cell
+    else:
+        header_cells.append(Paragraph("", styles['Normal']))  # Empty cell if logo not found
+    
+    # Center: Title "VMRC Mortality Calculation"
+    title_style = ParagraphStyle(
+        'HeaderTitle',
+        parent=styles['Heading1'],
+        fontSize=22,
+        textColor=colors.HexColor('#111827'),
+        alignment=1,  # Center
+        spaceAfter=0,
+        spaceBefore=0,
+        fontName='Helvetica-Bold',  # Font weight 700 (bold)
+    )
+    header_cells.append(Paragraph("VMRC Mortality Calculation", title_style))
+    
+    # Right: VMRC logo (or empty space)
+    if vmrc_logo_path:
+        try:
+            from PIL import Image as PILImage
+            vmrc_img_pil = PILImage.open(vmrc_logo_path)
+            vmrc_img_width, vmrc_img_height = vmrc_img_pil.size
+            logo_height_pt = 40  # 40px height (strict requirement)
+            logo_width_pt = logo_height_pt * (vmrc_img_width / vmrc_img_height) if vmrc_img_height > 0 else logo_height_pt
+            vmrc_img = Image(str(vmrc_logo_path), width=logo_width_pt, height=logo_height_pt)
+            header_cells.append(vmrc_img)
+            print(f"[PDF] ✓ Adding VMRC logo to header from: {vmrc_logo_path}")
+        except Exception as e:
+            print(f"[PDF] Warning: Could not load VMRC logo for header: {e}")
+            header_cells.append(Paragraph("", styles['Normal']))  # Empty cell
+    else:
+        header_cells.append(Paragraph("", styles['Normal']))  # Empty cell if logo not found
+    
+    # Create header table with 3 columns: [OSU Logo | Title | VMRC Logo]
+    # Equivalent to: display: flex; align-items: center; justify-content: space-between;
+    header_table = Table([header_cells], colWidths=[2*inch, 6*inch, 2*inch])
+    header_table.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (0, 0), 'LEFT'),   # OSU logo left
+        ('ALIGN', (1, 0), (1, 0), 'CENTER'), # Title center (flex: 1 equivalent)
+        ('ALIGN', (2, 0), (2, 0), 'RIGHT'),  # VMRC logo right
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),  # align-items: center
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 12),  # 12px padding (equivalent)
+        ('TOPPADDING', (0, 0), (-1, -1), 12),     # 12px padding (equivalent)
+        ('LEFTPADDING', (0, 0), (-1, -1), 24),    # 24px left/right padding (equivalent)
+        ('RIGHTPADDING', (0, 0), (-1, -1), 24),
+        ('BACKGROUND', (0, 0), (-1, -1), colors.white),  # White background (or light gray if preferred)
+        ('LINEBELOW', (0, 0), (-1, -1), 2, colors.HexColor('#dddddd')),  # 2px border-bottom (#ddd)
+    ]))
+    
+    header_section.append(header_table)
+    
+    # Add header section to story FIRST (ensures it appears at top of page 1)
+    # Header callbacks (on_first_page, on_later_pages) will add header to all pages
+    story.append(KeepTogether(header_section))
+    story.append(Spacer(1, 0.25*inch))  # 20px margin-bottom equivalent
+    
+    # ============================================================
+    # METADATA SECTION: Export Date, Raster Label
+    # ============================================================
+    # Build human-readable raster label
+    raster_label = build_human_readable_raster_label(context)
+    
+    # REMOVED: AOI line - do not show AOI in PDF
     info_data = []
-    if aoi_name:
-        info_data.append(["AOI:", aoi_name])
     info_data.append(["Export Date:", datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
-    if raster_name:
-        info_data.append(["Raster Name:", raster_name])
+    info_data.append(["Raster:", raster_label])  # Use human-readable label, not filename
     
     if info_data:
         info_table = Table(info_data, colWidths=[1.5*inch, 8*inch])
@@ -1118,13 +1662,18 @@ def build_pdf_report(
     
     legend_table = Table(legend_data, colWidths=[1*inch, 1.5*inch])
     legend_style = TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#374151')),  # Header background
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),  # Header text
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2f3a4a')),  # Header background: #2f3a4a
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),  # Header text: white, bold
         ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 9),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-        ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),  # Font weight 700 (bold)
+        ('FONTSIZE', (0, 0), (-1, 0), 11),  # Header font size
+        ('FONTSIZE', (0, 1), (-1, -1), 9),  # Data rows keep original size
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),  # Header padding: 8px vertical
+        ('TOPPADDING', (0, 0), (-1, 0), 8),
+        ('LEFTPADDING', (0, 0), (-1, 0), 10),  # Header padding: 10px horizontal
+        ('RIGHTPADDING', (0, 0), (-1, 0), 10),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 4),  # Data row padding
+        ('TOPPADDING', (0, 1), (-1, -1), 4),
         ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
     ])
     # Color each row's first cell with the legend color
@@ -1159,15 +1708,20 @@ def build_pdf_report(
     
     stats_table = Table(stats_data, colWidths=[2*inch, 3*inch])
     stats_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#374151')),  # Header background
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),  # Header text
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2f3a4a')),  # Header background: #2f3a4a
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),  # Header text: white, bold
         ('BACKGROUND', (0, 1), (0, -1), colors.HexColor('#f9fafb')),  # Label column background
-        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#111827')),
+        ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#111827')),  # Data rows only (not header)
         ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 10),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),  # Header font weight 700 (bold)
+        ('FONTSIZE', (0, 0), (-1, 0), 12),  # Header font size
+        ('FONTSIZE', (0, 1), (-1, -1), 10),  # Data rows keep original size
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),  # Header padding: 8px vertical
+        ('TOPPADDING', (0, 0), (-1, 0), 8),
+        ('LEFTPADDING', (0, 0), (-1, 0), 10),  # Header padding: 10px horizontal
+        ('RIGHTPADDING', (0, 0), (-1, 0), 10),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 6),  # Data row padding
+        ('TOPPADDING', (0, 1), (-1, -1), 6),
         ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
         ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
     ]))
@@ -1200,16 +1754,21 @@ def build_pdf_report(
         
         threshold_table = Table(threshold_data, colWidths=[2.5*inch, 1.5*inch, 1.5*inch])
         threshold_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#374151')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2f3a4a')),  # Header background: #2f3a4a
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),  # Header text: white, bold
             ('BACKGROUND', (0, 1), (0, -1), colors.HexColor('#f9fafb')),
-            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#111827')),
+            ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#111827')),  # Data rows only (not header)
             ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
             ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),  # Numbers right-aligned
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),  # Header font weight 700 (bold)
+            ('FONTSIZE', (0, 0), (-1, 0), 12),  # Header font size
+            ('FONTSIZE', (0, 1), (-1, -1), 10),  # Data rows keep original size
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),  # Header padding: 8px vertical
+            ('TOPPADDING', (0, 0), (-1, 0), 8),
+            ('LEFTPADDING', (0, 0), (-1, 0), 10),  # Header padding: 10px horizontal
+            ('RIGHTPADDING', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 1), (-1, -1), 6),  # Data row padding
+            ('TOPPADDING', (0, 1), (-1, -1), 6),
             ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
             ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
         ]))
@@ -1235,16 +1794,21 @@ def build_pdf_report(
         
         range_table = Table(range_data, colWidths=[2*inch, 2*inch, 2*inch])
         range_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#374151')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2f3a4a')),  # Header background: #2f3a4a
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),  # Header text: white, bold
             ('BACKGROUND', (0, 1), (0, -1), colors.HexColor('#f9fafb')),
-            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#111827')),
+            ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#111827')),  # Data rows only (not header)
             ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
             ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),  # Header font weight 700 (bold)
+            ('FONTSIZE', (0, 0), (-1, 0), 12),  # Header font size
+            ('FONTSIZE', (0, 1), (-1, -1), 10),  # Data rows keep original size
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),  # Header padding: 8px vertical
+            ('TOPPADDING', (0, 0), (-1, 0), 8),
+            ('LEFTPADDING', (0, 0), (-1, 0), 10),  # Header padding: 10px horizontal
+            ('RIGHTPADDING', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 1), (-1, -1), 6),  # Data row padding
+            ('TOPPADDING', (0, 1), (-1, -1), 6),
             ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
         ]))
         range_section.append(range_table)
@@ -1252,7 +1816,9 @@ def build_pdf_report(
         story.append(KeepTogether(range_section))
     
     # Build PDF
+    print("[PDF] 🔵 About to call doc.build(story) - header callbacks will execute during build")
     doc.build(story)
+    print("[PDF] 🔵 doc.build(story) complete")
     
     # Get PDF bytes
     pdf_bytes = pdf_buffer.getvalue()
@@ -1452,15 +2018,51 @@ def export_multi_aoi_pdf(req: ExportRequest):
     
     # Prepare output directory
     export_id = uuid.uuid4().hex[:8]
-    base_filename = sanitize_filename(req.filename) if req.filename else generate_default_filename()
+    # Build base filename from context filters (with HSL/WH rules)
+    if req.filename:
+        base_filename = sanitize_filename(req.filename)
+    else:
+        # Use filter-based filename (without extension - will be added per format)
+        base_filename = build_export_filename(req.context, "")
+        if not base_filename:
+            base_filename = generate_default_filename()
     out_dir = Path("static/exports") / export_id
     out_dir.mkdir(parents=True, exist_ok=True)
     
-    pdf_name = f"{base_filename}_report.pdf"
+    pdf_name = f"{base_filename}.pdf"
     pdf_path = out_dir / pdf_name
     
-    # Create PDF
-    doc = SimpleDocTemplate(str(pdf_path), pagesize=letter, topMargin=0.5*inch)
+    # Create PDF with header callbacks
+    letter_size = letter  # 8.5" x 11"
+    
+    # Header callbacks - apply header on every page
+    def on_first_page_multi(canvas, doc):
+        """Add header on first page."""
+        print("[PDF MULTI-AOI] 🔵 on_first_page callback triggered")
+        draw_pdf_header(canvas, doc, letter_size)
+        print("[PDF MULTI-AOI] 🔵 on_first_page callback complete")
+    
+    def on_later_pages_multi(canvas, doc):
+        """Add header on subsequent pages."""
+        print("[PDF MULTI-AOI] 🔵 on_later_pages callback triggered")
+        draw_pdf_header(canvas, doc, letter_size)
+        print("[PDF MULTI-AOI] 🔵 on_later_pages callback complete")
+    
+    # Calculate top margin: HEADER_H (60pt) + 20pt padding = 80pt
+    HEADER_H = 60  # Header height in points
+    header_margin = (HEADER_H + 20) / 72.0 * inch  # Convert points to inches (72pt = 1 inch)
+    print(f"[PDF MULTI-AOI] Header margin: {header_margin} inches ({HEADER_H + 20} points)")
+    
+    doc = SimpleDocTemplate(
+        str(pdf_path),
+        pagesize=letter_size,
+        topMargin=header_margin,  # CRITICAL: Content starts BELOW header (HEADER_H + 20pt)
+        bottomMargin=0.5*inch,
+        leftMargin=0.5*inch,
+        rightMargin=0.5*inch,
+        onFirstPage=on_first_page_multi,
+        onLaterPages=on_later_pages_multi,
+    )
     story = []
     styles = getSampleStyleSheet()
     
@@ -1515,9 +2117,9 @@ def export_multi_aoi_pdf(req: ExportRequest):
         story.append(Paragraph(dataset_title, title_style))
         story.append(Spacer(1, 0.2*inch))
         
-        # AOI Name
-        story.append(Paragraph(f"<b>AOI:</b> {aoi_name}", styles['Normal']))
-        story.append(Spacer(1, 0.1*inch))
+        # REMOVED: AOI line - do not show AOI in PDF
+        # story.append(Paragraph(f"<b>AOI:</b> {aoi_name}", styles['Normal']))
+        # story.append(Spacer(1, 0.1*inch))
         
         # Date/Time
         story.append(Paragraph(f"<b>Export Date:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
@@ -1684,7 +2286,14 @@ def export_raster(req: ExportRequest):
 
     # Prepare output directory
     export_id = uuid.uuid4().hex[:8]
-    base_filename = sanitize_filename(req.filename) if req.filename else generate_default_filename()
+    # Build base filename from context filters (with HSL/WH rules)
+    if req.filename:
+        base_filename = sanitize_filename(req.filename)
+    else:
+        # Use filter-based filename (without extension - will be added per format)
+        base_filename = build_export_filename(req.context, "")
+        if not base_filename:
+            base_filename = generate_default_filename()
 
     # Save exports to static/exports for serving via StaticFiles
     out_dir = Path("static/exports") / export_id
@@ -1807,29 +2416,80 @@ def export_raster(req: ExportRequest):
                 
                 print(f"[EXPORT] Opening raster: {raster_path}")
                 with rasterio.open(raster_path) as src:
-                    raster_crs = src.crs
-                    print(f"[EXPORT] Raster CRS: {raster_crs}")
+                    # Log source raster properties
+                    print(f"[EXPORT] ========== SOURCE RASTER PROPERTIES ==========")
+                    print(f"[EXPORT] Source CRS: {src.crs}")
+                    print(f"[EXPORT] Source transform: {src.transform}")
+                    print(f"[EXPORT] Source width: {src.width}, height: {src.height}")
+                    print(f"[EXPORT] Source dtype: {src.dtypes[0]}")
+                    print(f"[EXPORT] Source nodata: {src.nodata}")
+                    print(f"[EXPORT] Source bounds: {src.bounds}")
+                    print(f"[EXPORT] ==============================================")
                     
-                    # Reproject geometry to raster CRS using rasterio.warp.transform_geom (more precise)
-                    # Input is EPSG:4326 (GeoJSON), output should be in raster CRS
+                    raster_crs = src.crs
+                    
+                    # Reproject geometry to raster CRS
                     print(f"[EXPORT] Reprojecting geometry from EPSG:4326 to {raster_crs}")
                     aoi_geom_src = mapping(user_geom_4326)  # Convert shapely to GeoJSON dict
                     aoi_geom_raster_crs = transform_geom(
-                            "EPSG:4326",
+                        "EPSG:4326",
                         raster_crs.to_string() if hasattr(raster_crs, 'to_string') else str(raster_crs),
                         aoi_geom_src,
-                        precision=6  # 6 decimal places for precision
-                        )
-                    shapes = [aoi_geom_raster_crs]  # Use GeoJSON dict directly
+                        precision=6
+                    )
                     
-                    print(f"[EXPORT] Clipping raster with geometry...")
+                    # Convert back to shapely for bounds calculation
+                    aoi_geom_shapely = shape(aoi_geom_raster_crs)
                     
-                    # Determine nodata value: use source nodata if available, otherwise choose based on dtype
+                    # Get bounds of reprojected geometry
+                    aoi_bounds = aoi_geom_shapely.bounds  # (minx, miny, maxx, maxy)
+                    print(f"[EXPORT] AOI bounds in raster CRS: {aoi_bounds}")
+                    
+                    # ============================================================
+                    # COMPUTE PIXEL-ALIGNED WINDOW
+                    # ============================================================
+                    # This ensures the output aligns with the source grid
+                    # No resampling, no warping - just a true clip of source pixels
+                    print(f"[EXPORT] Computing pixel-aligned window...")
+                    win = from_bounds(
+                        aoi_bounds[0],  # minx (west)
+                        aoi_bounds[1],  # miny (south)
+                        aoi_bounds[2],  # maxx (east)
+                        aoi_bounds[3],  # maxy (north)
+                        src.transform
+                    )
+                    
+                    # Round window to pixel boundaries (align to source grid)
+                    win = win.round_offsets().round_lengths()
+                    print(f"[EXPORT] Pixel-aligned window: {win}")
+                    print(f"[EXPORT] Window row_off: {win.row_off}, col_off: {win.col_off}")
+                    print(f"[EXPORT] Window height: {win.height}, width: {win.width}")
+                    
+                    # Ensure window is within source bounds
+                    # Clamp window offsets and sizes to source dimensions
+                    row_off = max(0, int(win.row_off))
+                    col_off = max(0, int(win.col_off))
+                    row_end = min(src.height, row_off + int(win.height))
+                    col_end = min(src.width, col_off + int(win.width))
+                    
+                    # Recreate window with clamped bounds
+                    win = Window(col_off=col_off, row_off=row_off, width=col_end - col_off, height=row_end - row_off)
+                    print(f"[EXPORT] Clamped window: row_off={row_off}, col_off={col_off}, height={win.height}, width={win.width}")
+                    
+                    # Read raw band data from window (no resampling, no warping)
+                    print(f"[EXPORT] Reading raw data from window...")
+                    windowed_data = src.read(window=win)
+                    print(f"[EXPORT] Windowed data shape: {windowed_data.shape}")
+                    
+                    # Get transform for the window (aligned to source grid)
+                    out_transform = src.window_transform(win)
+                    print(f"[EXPORT] Output transform: {out_transform}")
+                    
+                    # Determine nodata value: use source nodata if available
                     nodata_value = src.nodata
                     if nodata_value is None:
                         # Choose a safe nodata value based on dtype
                         if np.issubdtype(src.dtypes[0], np.integer):
-                            # For integer types, use a value outside typical range
                             if src.dtypes[0] == np.uint8:
                                 nodata_value = 255
                             elif src.dtypes[0] == np.uint16:
@@ -1837,42 +2497,49 @@ def export_raster(req: ExportRequest):
                             else:
                                 nodata_value = -9999
                         else:
-                            # For float types
-                            nodata_value = -9999  # Use a sentinel value
+                            nodata_value = -9999
                         print(f"[EXPORT] Source has no nodata, using {nodata_value} as nodata value")
                     
-                    # ============================================================
-                    # MASK RASTER: Use all_touched=True to include any touched pixel
-                    # ============================================================
-                    # all_touched=True ensures every pixel that is even slightly touched
-                    # by the AOI boundary is included. This guarantees no edge pixels are lost.
-                    #
-                    # Why this works:
-                    # - By default, mask() only includes pixels whose center falls inside the polygon
-                    # - all_touched=True includes ANY pixel touched or intersected by the boundary
-                    # - Combined with proper CRS reprojection, this ensures complete pixel coverage
-                    # ============================================================
-                    clipped, out_transform = mask(
-                        src,
-                        shapes,  # GeoJSON geometry dict in raster CRS
-                        crop=True,  # Crop to geometry bounds (no pre-windowing needed)
-                        all_touched=True,  # CRITICAL: Include any pixel touched by boundary
-                        filled=True,  # Fill masked areas with nodata
-                        nodata=nodata_value  # Use source nodata or safe default
+                    # Create mask for the windowed data
+                    # geometry_mask with invert=False returns True for pixels OUTSIDE the geometry
+                    # We want to mask (set to nodata) pixels outside the geometry
+                    print(f"[EXPORT] Creating geometry mask for windowed data...")
+                    mask_array = geometry_mask(
+                        [aoi_geom_raster_crs],
+                        out_shape=(win.height, win.width),
+                        transform=out_transform,
+                        invert=False,  # False = True for pixels OUTSIDE geometry (should be masked)
+                        all_touched=True  # Include any pixel touched by boundary
                     )
-                    print(f"[EXPORT] Clipped shape: {clipped.shape}")
-
-                    meta = src.meta.copy()
+                    
+                    # Apply mask: set pixels outside geometry to nodata
+                    # mask_array is True for pixels OUTSIDE the geometry
+                    for band_idx in range(windowed_data.shape[0]):
+                        windowed_data[band_idx][mask_array] = nodata_value
+                    
+                    print(f"[EXPORT] Mask applied. Final data shape: {windowed_data.shape}")
+                    
+                    # ============================================================
+                    # BUILD OUTPUT METADATA (preserve source properties)
+                    # ============================================================
+                    meta = src.profile.copy()  # Start with source profile
                     meta.update({
-                        "height": clipped.shape[1],
-                        "width": clipped.shape[2],
+                        "height": win.height,
+                        "width": win.width,
                         "transform": out_transform,
                         "driver": "GTiff",
                         "compress": "lzw",
+                        "nodata": nodata_value,
                     })
                     
-                    # Use the nodata value we set in mask() call
-                    meta["nodata"] = nodata_value
+                    # Log output properties for comparison
+                    print(f"[EXPORT] ========== OUTPUT RASTER PROPERTIES ==========")
+                    print(f"[EXPORT] Output CRS: {meta['crs']}")
+                    print(f"[EXPORT] Output transform: {meta['transform']}")
+                    print(f"[EXPORT] Output width: {meta['width']}, height: {meta['height']}")
+                    print(f"[EXPORT] Output dtype: {meta['dtype']}")
+                    print(f"[EXPORT] Output nodata: {meta['nodata']}")
+                    print(f"[EXPORT] ==============================================")
                     
                     # Build tags for metadata embedding
                     tags = {}
@@ -1900,7 +2567,7 @@ def export_raster(req: ExportRequest):
                     
                     print(f"[EXPORT] Writing GeoTIFF to {tif_path}...")
                     with rasterio.open(tif_path, "w", **meta) as dst:
-                        dst.write(clipped)
+                        dst.write(windowed_data)
                         # Write tags
                         dst.update_tags(**tags)
                     
@@ -2124,7 +2791,7 @@ def export_raster(req: ExportRequest):
         else:
             try:
                 print(f"[EXPORT] Generating PDF report with raster preview...")
-                pdf_name = f"{base_filename}_report.pdf"
+                pdf_name = f"{base_filename}.pdf"
                 pdf_path = out_dir / pdf_name
                 
                 # ============================================================
@@ -2447,61 +3114,15 @@ async def export_pdf_report(req: PDFExportRequest):
             raster_name = "Unknown"
         
         # ============================================================
-        # STEP 2: Generate filename (auto-generate if not provided)
+        # STEP 2: Generate filename from actual raster filename (matches Raster Overview)
         # ============================================================
         if req.filename:
             pdf_filename = sanitize_filename(req.filename)
             if not pdf_filename.endswith(".pdf"):
                 pdf_filename += ".pdf"
         else:
-            # Auto-generate filename from context
-            filename_parts = []
-            context = req.context or {}
-            
-            # Map type
-            if context.get("mapType"):
-                map_type = str(context.get("mapType")).upper()
-                if map_type == "MORTALITY":
-                    filename_parts.append("Mortality")
-                elif map_type == "HSL":
-                    filename_parts.append("HSL")
-                else:
-                    filename_parts.append(map_type)
-            
-            # Species
-            if context.get("species"):
-                species = str(context.get("species"))
-                if species == "Douglas-fir":
-                    filename_parts.append("DF")
-                elif species == "Western Hemlock":
-                    filename_parts.append("WH")
-                else:
-                    filename_parts.append(species.replace(" ", "_")[:10])
-            
-            # Condition
-            if context.get("condition"):
-                condition = str(context.get("condition")).upper()
-                filename_parts.append(condition[0] if condition else "")
-            
-            # Month (for mortality)
-            if context.get("month"):
-                filename_parts.append(str(context.get("month")))
-            
-            # Cover percent
-            if context.get("coverPercent"):
-                filename_parts.append(f"Cover{context.get('coverPercent')}")
-            
-            # HSL class (for HSL maps)
-            if context.get("hslClass"):
-                filename_parts.append(str(context.get("hslClass")))
-            
-            # Join parts
-            if filename_parts:
-                pdf_filename = "_".join(filename_parts) + ".pdf"
-            else:
-                pdf_filename = f"vmrc_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-            
-            pdf_filename = sanitize_filename(pdf_filename)
+            # Use filter-based filename (with HSL/WH rules)
+            pdf_filename = build_export_filename(req.context, ".pdf")
         
         print(f"[PDF EXPORT] PDF filename: {pdf_filename}")
         
@@ -2549,6 +3170,9 @@ async def export_pdf_report(req: PDFExportRequest):
         # ============================================================
         # STEP 5: Generate PDF with landscape orientation
         # ============================================================
+        print("[PDF EXPORT] 🔵 PDF export: START")
+        print("[PDF EXPORT] 🔵 About to call build_pdf_report_landscape")
+        
         legend_bins = [
             {"range": "0–10", "color": "#006400", "label": "0–10"},
             {"range": "10–20", "color": "#228B22", "label": "10–20"},
@@ -2573,7 +3197,7 @@ async def export_pdf_report(req: PDFExportRequest):
             context=context
         )
         
-        print(f"[PDF EXPORT] ✓ Generated PDF ({len(pdf_bytes)} bytes)")
+        print(f"[PDF EXPORT] 🔵 PDF export: COMPLETE - Generated PDF ({len(pdf_bytes)} bytes)")
         
         # ============================================================
         # STEP 6: Return PDF as streaming response
