@@ -60,7 +60,7 @@ export async function uploadAOI(file) {
  * @param {Object} params
  * @param {number} params.rasterLayerId - ID of the raster layer to clip
  * @param {Object} params.userClipGeoJSON - GeoJSON polygon defining the AOI
- * @param {number} [params.zoom] - Optional Leaflet zoom level for high-res overlay (zoom >= 12)
+ * @param {number} [params.zoom] - (Deprecated) Previously used for zoom-based display resampling. Generation is now zoom-independent.
  */
 export async function clipRaster({ rasterLayerId, userClipGeoJSON, zoom }) {
   const res = await fetch(apiUrl("/api/v1/rasters/clip"), {
@@ -69,7 +69,7 @@ export async function clipRaster({ rasterLayerId, userClipGeoJSON, zoom }) {
     body: JSON.stringify({
       raster_layer_id: rasterLayerId,
       user_clip_geojson: userClipGeoJSON,
-      zoom: zoom,  // Send zoom level for display overlay resampling
+      // zoom intentionally not sent: generation must be zoom-independent
     }),
   });
 

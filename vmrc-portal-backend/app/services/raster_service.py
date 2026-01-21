@@ -122,15 +122,15 @@ def clip_raster_for_layer(raster_layer_id: int, user_clip_geojson: dict, zoom: O
     
     This function:
     1. Resolves raster_layer_id to absolute file path
-    2. Optionally resamples to higher resolution for display overlay (if zoom >= 12)
+    2. Generates an overlay PNG from the AOI geometry (zoom-independent; no view/zoom-derived resampling)
     3. Clips to user AOI with all_touched=True
     4. Generates PNG overlay and computes histogram from native resolution
     
     Args:
         raster_layer_id: ID of the raster layer to clip
         user_clip_geojson: GeoJSON polygon defining the AOI (EPSG:4326)
-        zoom: Optional Leaflet zoom level. If >= 12, generates high-res display overlay.
-              If None or < 12, uses native resolution with half-pixel buffer fallback.
+        zoom: Deprecated. Previously used for zoom-based display overlay resampling.
+              Generation is now zoom-independent; AOI geometry is the only driver.
     
     Returns:
         dict with overlay_url, stats, bounds, pixels, histogram
@@ -415,22 +415,13 @@ def clip_raster_for_layer(raster_layer_id: int, user_clip_geojson: dict, zoom: O
     original_geom_raster_crs = aoi_geom_raster_crs.copy()
     
     # ============================================================
-    # ZOOM-BASED DISPLAY OVERLAY: High-res resampling for zoom >= 12
+    # IMPORTANT: Generation must be zoom-independent.
+    # We intentionally ignore any provided `zoom` when clipping/stats generation.
     # ============================================================
-    # If zoom >= 12, resample raster to finer resolution (5-10m) for display overlay.
-    # This provides smooth, non-blocky appearance when zoomed in.
-    # 
-    # Histogram/analysis always uses native resolution (separate clipping).
-    # Fallback: If zoom < 12 or not provided, use half-pixel buffer (current approach).
-    # ============================================================
-    
-    ZOOM_THRESHOLD = 12  # Resample when zoom >= this level
-    TARGET_RESOLUTION = 7.0  # Target pixel size in meters for high-res overlay
-    
-    use_high_res_overlay = zoom is not None and zoom >= ZOOM_THRESHOLD
-    
-    print(f"\n[CLIP] Zoom level: {zoom}")
-    print(f"[CLIP] High-res overlay: {'YES' if use_high_res_overlay else 'NO (using buffer fallback)'}")
+    if zoom is not None:
+        print(f"\n[CLIP] Zoom provided by client (deprecated, ignored): {zoom}")
+    # Keep variable for backward-compatible code paths; always disabled now.
+    use_high_res_overlay = False
     
     try:
         with rasterio.open(raster_path) as src:
@@ -459,107 +450,9 @@ def clip_raster_for_layer(raster_layer_id: int, user_clip_geojson: dict, zoom: O
             else:
                 print(f"[CLIP] Using source nodata value: {nodata_value}")
             
-            if use_high_res_overlay:
-                # ============================================================
-                # HIGH-RES DISPLAY OVERLAY: Resample to finer resolution
-                # ============================================================
-                print(f"[CLIP] Resampling to {TARGET_RESOLUTION}m resolution for display overlay...")
-                
-                # Get AOI bounds in raster CRS for resampling extent
-                aoi_bounds = original_geom_shapely.bounds
-                minx, miny, maxx, maxy = aoi_bounds
-                
-                # Add small buffer for resampling extent (2 pixel margin)
-                margin = max(abs(native_res_x), abs(native_res_y)) * 2
-                resample_bounds = (minx - margin, miny - margin, maxx + margin, maxy + margin)
-                
-                # Calculate target dimensions
-                width_m = resample_bounds[2] - resample_bounds[0]
-                height_m = resample_bounds[3] - resample_bounds[1]
-                target_width = int(width_m / TARGET_RESOLUTION)
-                target_height = int(height_m / TARGET_RESOLUTION)
-                
-                # Create target transform for resampled raster
-                target_transform = from_bounds(
-                    resample_bounds[0], resample_bounds[1],
-                    resample_bounds[2], resample_bounds[3],
-                    target_width, target_height
-                )
-                
-                print(f"[CLIP] Resampled dimensions: {target_width}x{target_height}")
-                print(f"[CLIP] Resampled resolution: {TARGET_RESOLUTION}m")
-                
-                # Resample raster to higher resolution
-                # Use nearest-neighbor to preserve crisp, pixelated appearance (no smoothing)
-                resampled_data = np.zeros((src.count, target_height, target_width), dtype=src.dtypes[0])
-                
-                reproject(
-                    source=rasterio.band(src, range(1, src.count + 1)),
-                    destination=resampled_data,
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    dst_transform=target_transform,
-                    dst_crs=src.crs,
-                    resampling=Resampling.nearest  # Use nearest-neighbor for crisp, pixelated pixels (no smoothing)
-                )
-                
-                # Create in-memory raster dataset for resampled data
-                from rasterio.io import MemoryFile
-                memfile = MemoryFile()
-                
-                resampled_profile = src.profile.copy()
-                resampled_profile.update({
-                    'width': target_width,
-                    'height': target_height,
-                    'transform': target_transform,
-                    'nodata': nodata_value,
-                })
-                
-                with memfile.open(**resampled_profile) as resampled_src:
-                    resampled_src.write(resampled_data)
-                    
-                    # Now clip the resampled raster with AOI (no buffer needed with high-res)
-                    shapes_overlay = [aoi_geom_raster_crs]  # Use original geometry
-                    
-                    print(f"[CLIP] Clipping resampled raster with AOI polygon (not bbox)...")
-                    # CRITICAL: Use polygon geometry, NOT bounds - this applies true polygon mask
-                    clipped, out_transform = mask(
-                        resampled_src,
-                        shapes_overlay,  # Polygon geometry in raster CRS (GeoJSON dict)
-                        crop=True,  # Crop to polygon bounds (but mask by polygon shape)
-                        all_touched=True,  # Include any pixel touched by polygon boundary
-                        filled=True,  # Fill outside polygon with nodata
-                        nodata=nodata_value  # Pixels outside polygon become this value
-                    )
-                    
-                    # Debug validation: Check that mask was applied correctly
-                    # Guard against empty arrays before calling np.mean()
-                    if clipped.size == 0:
-                        print(f"[DEBUG] ⚠️  Clipped result is empty: shape={clipped.shape}")
-                    else:
-                        try:
-                            if clipped.ndim == 3:
-                                if clipped.shape[0] > 0:
-                                    check_band = np.mean(clipped, axis=0)
-                                else:
-                                    check_band = clipped[0] if clipped.shape[0] == 1 else np.zeros_like(clipped[0])
-                            else:
-                                check_band = clipped
-                            nodata_count = np.sum((check_band == nodata_value) & np.isfinite(check_band))
-                            total_pixels = check_band.size
-                            nodata_percent = (nodata_count / total_pixels * 100) if total_pixels > 0 else 0
-                            print(f"[DEBUG] Mask validation: {nodata_count}/{total_pixels} pixels are nodata ({nodata_percent:.1f}%)")
-                        except (ValueError, ZeroDivisionError) as e:
-                            print(f"[DEBUG] ⚠️  Error computing mask validation: {e}")
-                        print(f"[DEBUG] Output shape: {clipped.shape}")
-                        print(f"[DEBUG] ✓ Polygon mask applied - outside AOI is nodata (will be transparent)")
-                
-                print(f"[CLIP] ✓ High-res overlay generated ({target_width}x{target_height} pixels)")
-            
-            else:
-                # ============================================================
-                # FALLBACK: Half-pixel buffer for native resolution overlay
-                # ============================================================
+            # ============================================================
+            # Overlay generation (zoom-independent): half-pixel buffer at native resolution
+            # ============================================================
                 # Raster resolution causes unavoidable edge stair-stepping;
                 # buffering improves visual coverage.
                 # 
@@ -801,60 +694,28 @@ def clip_raster_for_layer(raster_layer_id: int, user_clip_geojson: dict, zoom: O
     print(f"[PNG MASK] ✓ Mask correctly identifies polygon interior vs exterior")
     
     # ============================================================
-    # HISTOGRAM: Always use native resolution (not resampled display)
+    # HISTOGRAM / STATS: Use AOI geometry only (zoom-independent)
     # ============================================================
-    # CRITICAL: Histogram must use native raster values, not resampled display overlay.
-    # If we used high-res overlay, we need to clip native raster separately for histogram.
-    # This ensures histogram matches actual raster data, not interpolated display values.
+    # Overlay uses buffered geometry for visual coverage, but histogram/stats must use
+    # the ORIGINAL AOI geometry only (no buffer, no zoom-derived resampling).
+    #
+    # We already have `band` from the buffered clip; filter it back down to the
+    # original AOI footprint using geometry_mask + the clipped transform.
     # ============================================================
-    
-    if use_high_res_overlay:
-        # Clip native raster separately for histogram (not resampled)
-        print(f"\n[HISTOGRAM] Clipping native resolution raster for histogram...")
-        with rasterio.open(raster_path) as native_src:
-            # Use original geometry (not buffered) for histogram accuracy
-            shapes_histogram = [original_geom_raster_crs]
-            
-            native_clipped, native_transform = mask(
-                native_src,
-                shapes_histogram,
-                crop=True,
-                all_touched=True,
-                filled=True,
-                nodata=nodata_value
-            )
-            
-            # Extract native band for histogram
-            if native_clipped.ndim == 3:
-                native_band = np.mean(native_clipped, axis=0).astype(float)
-            else:
-                native_band = native_clipped.astype(float)
-            
-            # Create histogram mask: inside original polygon AND not nodata
-            mask_valid_histogram = np.ones(native_band.shape, dtype=bool)
-            if nodata_value is not None:
-                mask_valid_histogram = mask_valid_histogram & (native_band != nodata_value)
-            mask_valid_histogram = mask_valid_histogram & np.isfinite(native_band)
-            
-            valid_pixels_histogram = native_band[mask_valid_histogram]
-            
-            print(f"[HISTOGRAM] Native resolution: {native_src.res}")
-            print(f"[HISTOGRAM] Valid pixels: {valid_pixels_histogram.size}")
-    else:
-        # Use geometry_mask to filter buffered clip to original AOI
-        mask_original_geom = geometry_mask(
-            [original_geom_raster_crs],  # Original geometry (not buffered)
-            out_shape=band.shape,
-            transform=out_transform,
-            invert=True,  # Invert: True = inside original polygon
-            all_touched=True  # Include all pixels touched by original boundary
-        )
-        
-        # Combine: valid for histogram = inside original polygon AND not nodata
-        mask_valid_histogram = mask_original_geom & (band != nodata_value) if nodata_value is not None else mask_original_geom
-        mask_valid_histogram = mask_valid_histogram & np.isfinite(band)
-        
-        valid_pixels_histogram = band[mask_valid_histogram]
+    mask_original_geom = geometry_mask(
+        [original_geom_raster_crs],  # Original geometry (not buffered)
+        out_shape=band.shape,
+        transform=out_transform,
+        invert=True,  # True = inside original polygon
+        all_touched=True
+    )
+
+    mask_valid_histogram = mask_original_geom
+    if nodata_value is not None:
+        mask_valid_histogram = mask_valid_histogram & (band != nodata_value)
+    mask_valid_histogram = mask_valid_histogram & np.isfinite(band)
+
+    valid_pixels_histogram = band[mask_valid_histogram]
     
     # Final sanity check
     print(f"\n[PNG PREP] Overlay mask: {mask_valid_overlay.sum()} pixels")
@@ -878,28 +739,14 @@ def clip_raster_for_layer(raster_layer_id: int, user_clip_geojson: dict, zoom: O
         raise NoValidDataError(error_msg)
     
     if valid_pixels_histogram.size == 0:
-        print(f"[WARNING] Original AOI contains no valid pixels after clipping.")
-        if not use_high_res_overlay:
-            # Fallback: use buffered pixels for histogram (only in fallback mode)
-            # But only if buffered pixels exist (they should, since we checked valid_pixels_overlay above)
-            if valid_pixels_overlay.size > 0:
-                print(f"[WARNING] Using buffered pixels for histogram.")
-                valid_pixels_histogram = valid_pixels_overlay
-            else:
-                # Both are empty - this should not happen due to check above, but safety guard
-                error_msg = "AOI contains no valid raster pixels (outside extent or all nodata)."
-                print(f"[ERROR] Both overlay and histogram pixels are empty.")
-                class NoValidDataError(ValueError):
-                    """Custom exception for no valid data - should return 422"""
-                    pass
-                raise NoValidDataError(error_msg)
-        else:
-            error_msg = "AOI contains no valid raster pixels (outside extent or all nodata)."
-            print(f"[ERROR] Histogram: No valid pixels in original AOI at native resolution.")
-            class NoValidDataError(ValueError):
-                """Custom exception for no valid data - should return 422"""
-                pass
-            raise NoValidDataError(error_msg)
+        # If overlay has valid pixels but original AOI mask yields none, treat it as no-data.
+        # This keeps behavior consistent and avoids silently switching to buffered stats.
+        error_msg = "AOI contains no valid raster pixels (outside extent or all nodata)."
+        print(f"[ERROR] Histogram: No valid pixels in original AOI at native resolution.")
+        class NoValidDataError(ValueError):
+            """Custom exception for no valid data - should return 422"""
+            pass
+        raise NoValidDataError(error_msg)
 
     # -----------------------------
     # Chart data (for histogram/heatmap) - use ORIGINAL geometry

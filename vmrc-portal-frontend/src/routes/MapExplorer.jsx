@@ -86,6 +86,14 @@ export default function MapExplorer() {
     name: null, // display name
   });
 
+  // ======================================================
+  // ACTIVE AOI ID - Single source of truth for "only one AOI"
+  // ======================================================
+  // Only ONE AOI can be active at a time
+  // Sidebar (Histogram + Created Rasters) shows data ONLY for activeAoiId
+  // ======================================================
+  const [activeAoiId, setActiveAoiId] = useState(null); // string | null
+
   const [activeTab, setActiveTab] = useState("table");
 
   // ✅ FIX: Right panel data (was missing, caused "stats is not defined")
@@ -150,6 +158,7 @@ export default function MapExplorer() {
     try {
       const savedRasters = sessionStorage.getItem("vmrc_created_rasters");
       const savedActiveId = sessionStorage.getItem("vmrc_active_created_raster_id");
+      const savedActiveAoiId = sessionStorage.getItem("vmrc_active_aoi_id");
       
       let parsedRasters = null;
       
@@ -162,6 +171,12 @@ export default function MapExplorer() {
           console.warn("[Session] Invalid saved rasters format, skipping restore");
           parsedRasters = null;
         }
+      }
+      
+      if (savedActiveAoiId) {
+        const parsedAoiId = JSON.parse(savedActiveAoiId);
+        console.log(`[Session] Restored active AOI ID: ${parsedAoiId}`);
+        setActiveAoiId(parsedAoiId);
       }
       
       if (savedActiveId) {
@@ -185,6 +200,7 @@ export default function MapExplorer() {
       // Clear corrupted data
       sessionStorage.removeItem("vmrc_created_rasters");
       sessionStorage.removeItem("vmrc_active_created_raster_id");
+      sessionStorage.removeItem("vmrc_active_aoi_id");
     }
   }, []); // Run only on mount
 
@@ -219,6 +235,46 @@ export default function MapExplorer() {
       console.error("[Session] Failed to save activeCreatedRasterId to sessionStorage:", err);
     }
   }, [activeCreatedRasterId]);
+
+  // ======================================================
+  // SESSION PERSISTENCE: Save active AOI ID to sessionStorage on change
+  // ======================================================
+  useEffect(() => {
+    try {
+      sessionStorage.setItem("vmrc_active_aoi_id", JSON.stringify(activeAoiId));
+    } catch (err) {
+      console.error("[Session] Failed to save activeAoiId to sessionStorage:", err);
+    }
+  }, [activeAoiId]);
+
+  // ======================================================
+  // EFFECT: Restore active raster overlay when map is ready
+  // ======================================================
+  // When activeCreatedRasterId is set and map is ready, show the active raster overlay
+  useEffect(() => {
+    if (!activeCreatedRasterId || !mapInstanceRef.current) return;
+    
+    const raster = createdRasters.find((r) => r.id === activeCreatedRasterId);
+    if (!raster) return;
+    
+    // Wait a bit for LayerGroupManager to initialize
+    const timer = setTimeout(() => {
+      if (mapInstanceRef.current && mapInstanceRef.current._layerGroupManager) {
+        const manager = mapInstanceRef.current._layerGroupManager;
+        
+        // Show the active raster overlay
+        if (raster.aoiId) {
+          manager.setActiveRasterForAoi(raster.aoiId, activeCreatedRasterId);
+        } else {
+          manager.showRasterOverlay(activeCreatedRasterId);
+        }
+        
+        console.log(`[MapExplorer] ✅ Restored active raster overlay: rasterId=${activeCreatedRasterId}`);
+      }
+    }, 100);
+    
+    return () => clearTimeout(timer);
+  }, [activeCreatedRasterId, createdRasters]);
 
   // ======================================================
   // EFFECT: Clear stale filter state when switching map type or species
@@ -442,19 +498,23 @@ export default function MapExplorer() {
       return; // Early return - do NOT clear overlays
     }
     
-    console.log("[MapExplorer] Starting new AOI - clearing overlays ONLY (preserving all AOIs)");
+    console.log("[MapExplorer] Starting new AOI - enforcing only one AOI at a time");
     console.log("[MapExplorer] Reason:", reason);
     
     // ============================================================
-    // CRITICAL: This function ONLY clears overlays and stats
-    // It does NOT clear AOI state (userClip, aois, uploadedAois)
-    // AOIs must persist until explicitly erased by user
+    // ENFORCE "ONLY ONE AOI" - Clear old AOI and all its data
     // ============================================================
+    const oldActiveAoiId = activeAoiId;
+    
+    if (oldActiveAoiId && mapInstanceRef.current?._layerGroupManager) {
+      console.log(`[MapExplorer] Removing old active AOI ${oldActiveAoiId} before starting new one`);
+      // Remove old AOI and all its rasters from map
+      mapInstanceRef.current._layerGroupManager.removeAoiAndAllRasters(oldActiveAoiId);
+    }
     
     // Clear all created rasters (overlays) when starting a NEW draw
     // This ensures the map is clean for the new AOI
-    // Existing AOIs (drawn/uploaded) are NOT cleared - they remain for regeneration
-    console.trace("[CLEAR_OVERLAYS] handleStartNewAoi - clearing createdRasters ONLY");
+    console.trace("[CLEAR_OVERLAYS] handleStartNewAoi - clearing createdRasters");
     console.log("[CLEAR_OVERLAY] ⚠️ setCreatedRasters([]) called from handleStartNewAoi");
     setCreatedRasters([]);
     
@@ -467,19 +527,14 @@ export default function MapExplorer() {
     setPixelValues([]);
     setHistogram(null);
     
-    // CRITICAL: We do NOT clear:
-    // - userClip (drawn AOI state)
-    // - userClipRef (persistent ref for drawn AOI)
-    // - drawnAoiIdRef (persistent ref for drawn AOI ID)
-    // - aois (AOI array - contains both drawn and uploaded)
-    // - uploadedAois (uploaded AOI list)
-    // - selectedAois (selected AOIs for overlap detection)
-    // - activeAoi (active AOI state - will be updated when new AOI is drawn)
+    // Clear active AOI ID (will be set when new AOI is created)
+    setActiveAoiId(null);
     
     // Clear sessionStorage (only overlay-related data)
     try {
       sessionStorage.removeItem("vmrc_created_rasters");
       sessionStorage.removeItem("vmrc_active_created_raster_id");
+      sessionStorage.removeItem("vmrc_active_aoi_id");
       console.log("[Session] Cleared sessionStorage for new AOI");
     } catch (err) {
       console.error("[Session] Failed to clear sessionStorage:", err);
@@ -649,6 +704,9 @@ export default function MapExplorer() {
     // ============================================================
     // SET ACTIVE AOI when user finishes drawing
     // ============================================================
+    // ✅ Set activeAoiId as single source of truth
+    setActiveAoiId(stableAoiId);
+    
     setActiveAoi({
       source: "drawn",
       id: stableAoiId, // Use stable aoiId (matches aoi.id in aois array)
@@ -733,10 +791,41 @@ export default function MapExplorer() {
     return parts.join(" · ");
   }
 
+  // Extract base filename from raster name (matches Raster Overview exactly)
+  // This is the ONLY source of truth - uses the same value shown in "Raster Name:" in StatsTable
+  // Example: "HSL2.5_DF_50_D_l.tif" -> "HSL2.5_DF_50_D_l"
+  // Handles filenames with dots in the name (e.g., "HSL2.5") correctly
+  function getExportBaseFromRasterName(rasterPath) {
+    if (!rasterPath) {
+      console.warn("[Export] No raster name available, using default");
+      return "export";
+    }
+    
+    // 1) Extract basename (handle Windows paths: split on / or \ and take last part)
+    const base = String(rasterPath).split(/[\\/]/).pop();
+    
+    // 2) Strip ONLY the FINAL extension using lastIndexOf(".")
+    // This preserves dots in the filename (e.g., "HSL2.5")
+    const idx = base.lastIndexOf(".");
+    const exportBase = idx > 0 ? base.slice(0, idx) : base;
+    
+    // 3) Sanitize for Windows (remove invalid chars: : / \ * ? " < > |)
+    // But keep the name structure otherwise identical
+    const sanitized = exportBase.replace(/[:/\\*?"<>|]/g, '_');
+    
+    console.log(`[Export] getExportBaseFromRasterName:`);
+    console.log(`  rasterPath: ${rasterPath}`);
+    console.log(`  basename: ${base}`);
+    console.log(`  exportBase: ${sanitized}`);
+    
+    return sanitized || "export";
+  }
+
   // Build export filename from current filters
   // Format: {MapType}_{Species}_{Cover}_{Climate}_{Month}
   // Example: HSL_DF_50_DRY_04
   // Note: Backend adds file extensions automatically (.tif, .pdf, etc.)
+  // DEPRECATED: Use getRasterBaseFilename() instead to match Raster Overview
   function buildExportName(mapType, species, month, condition, coverPercent, hslCondition, fileExtension = "") {
     // Map type prefix
     const mapTypePrefix = mapType === "hsl" ? "HSL" : "Mortality";
@@ -767,6 +856,81 @@ export default function MapExplorer() {
     // Build filename (without extension - backend adds it)
     const filename = `${mapTypePrefix}_${speciesCode}_${cover}_${climateCode}_${monthCode}${fileExtension ? `.${fileExtension}` : ""}`;
     return filename;
+  }
+
+  // Build export filename for PDF downloads matching selected parameters
+  // Format: HSL_DF_DRY_M04_Cover50_ClassI.pdf or HSL_WH_WET_M09_Cover100_ClassII.pdf
+  // Uses the SAME filter snapshot as PDF metadata
+  function buildExportFilename({ mapType, species, condition, month, coverPercent, hslCondition, hslClass, dfStress }) {
+    const parts = [];
+
+    // Map Type
+    if (mapType === "hsl") {
+      parts.push("HSL");
+    } else if (mapType === "mortality") {
+      parts.push("Mortality");
+    }
+
+    // Species code: DF or WH
+    const speciesCode = species === "Douglas-fir" ? "DF" : "WH";
+    parts.push(speciesCode);
+
+    // Condition/Climate
+    let climateCode = "DRY";
+    if (mapType === "hsl" && hslCondition) {
+      // For HSL, use hslCondition (D/W/N)
+      if (hslCondition === "W" || hslCondition === "Wet") climateCode = "WET";
+      else if (hslCondition === "N" || hslCondition === "Normal") climateCode = "NORMAL";
+      else climateCode = "DRY";
+    } else if (condition) {
+      // For Mortality, use condition (Dry/Wet/Normal)
+      if (condition === "Wet") climateCode = "WET";
+      else if (condition === "Normal") climateCode = "NORMAL";
+      else climateCode = "DRY";
+    }
+    parts.push(climateCode);
+
+    // Month (zero-padded, with M prefix) - include if available
+    if (month) {
+      const monthCode = String(month).padStart(2, "0");
+      parts.push(`M${monthCode}`);
+    }
+
+    // Cover Percent
+    if (coverPercent) {
+      parts.push(`Cover${coverPercent}`);
+    }
+
+    // Class/Stress Level
+    if (mapType === "hsl" && hslClass) {
+      // Map class codes to Roman numerals
+      const classMap = {
+        l: "ClassI",
+        ml: "ClassII",
+        m: "ClassIII",
+        mh: "ClassIV",
+        h: "ClassV",
+        vh: "ClassVI"
+      };
+      const classLabel = classMap[hslClass.toLowerCase()] || `Class${hslClass}`;
+      parts.push(classLabel);
+    } else if (mapType === "mortality" && dfStress && species === "Douglas-fir") {
+      // Extract stress code from dfStress string
+      const stressCode = extractDfStressCode(dfStress);
+      const classMap = {
+        l: "ClassI",
+        ml: "ClassII",
+        m: "ClassIII",
+        mh: "ClassIV",
+        h: "ClassV",
+        vh: "ClassVI"
+      };
+      const classLabel = classMap[stressCode] || `Class${stressCode}`;
+      parts.push(classLabel);
+    }
+
+    // Join with underscores and add .pdf extension
+    return `${parts.join("_")}.pdf`;
   }
 
   // ======================================================
@@ -1101,15 +1265,10 @@ export default function MapExplorer() {
   }, []);
 
   // ======================================================
-  // Upsert function: Replace existing raster for same aoiId, or add new one
+  // Add function: Append a raster instance (do NOT replace existing for same AOI)
   // ======================================================
-  const upsertCreatedRaster = useCallback((newRaster) => {
-    setCreatedRasters((prev) => {
-      // Remove existing raster with same aoiId (if any)
-      const filtered = prev.filter((r) => r.aoiId !== newRaster.aoiId);
-      // Add new raster
-      return [...filtered, newRaster];
-    });
+  const addCreatedRaster = useCallback((newRaster) => {
+    setCreatedRasters((prev) => [...prev, newRaster]);
   }, []);
 
   // ======================================================
@@ -1305,33 +1464,30 @@ export default function MapExplorer() {
 
     const rasterLayerId = rasterResult.id;
 
-    // Zoom check (keep your existing logic - same for all AOIs)
+    // Optional UI-only zoom warning (do NOT block generation or force zoom changes).
+    // Generation must be zoom-independent; backend clips/statistics use AOI geometry only.
     if (mapInstanceRef.current) {
-      const map = mapInstanceRef.current;
-      const zoom = map.getZoom();
-      const center = map.getCenter();
+      try {
+        const map = mapInstanceRef.current;
+        const zoom = map.getZoom();
+        const center = map.getCenter();
 
-      const RASTER_PIXEL_SIZE_M = 750;
-      const MAX_PIXEL_SCREEN_SIZE = 90;
+        const RASTER_PIXEL_SIZE_M = 750;
+        const MAX_PIXEL_SCREEN_SIZE = 90;
 
-      const metersPerScreenPixel =
-        (156543.03392 * Math.cos((center.lat * Math.PI) / 180)) / Math.pow(2, zoom);
+        const metersPerScreenPixel =
+          (156543.03392 * Math.cos((center.lat * Math.PI) / 180)) / Math.pow(2, zoom);
 
-      const pixelScreenSize = RASTER_PIXEL_SIZE_M / metersPerScreenPixel;
+        const pixelScreenSize = RASTER_PIXEL_SIZE_M / metersPerScreenPixel;
 
-      if (pixelScreenSize > MAX_PIXEL_SCREEN_SIZE) {
-        const metersPerPixelAtZoom0 = 156543.03392 * Math.cos((center.lat * Math.PI) / 180);
-        const maxZoom = Math.floor(
-          Math.log2((MAX_PIXEL_SCREEN_SIZE * metersPerPixelAtZoom0) / RASTER_PIXEL_SIZE_M)
-        );
-
-        alert(
-          "You're zoomed in too far. Each raster pixel is huge at this zoom, so the overlay won't look true-to-size. " +
-            "We'll zoom out to the closest valid level so pixels cover the triangle correctly."
-        );
-
-        map.setZoom(maxZoom);
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        if (pixelScreenSize > MAX_PIXEL_SCREEN_SIZE) {
+          console.warn(
+            `[MapExplorer] Generating at high zoom (z=${zoom}). Overlay may look blocky at this view resolution, but generation will proceed.`
+          );
+        }
+      } catch (e) {
+        // Never block generation due to UI warning calculation issues
+        console.warn("[MapExplorer] Zoom warning calculation failed (ignored):", e);
       }
     }
 
@@ -1370,8 +1526,8 @@ export default function MapExplorer() {
         // Read from current state to ensure we have the latest data
         // Use stable aoiId for comparison (for drawn AOIs, use drawnAoiIdRef.current)
         const stableAoiIdForCheck = aoi.type === "draw" ? (drawnAoiIdRef.current || aoi.id) : aoi.id;
-        const existingRaster = createdRasters.find(r => r.aoiId === stableAoiIdForCheck);
-        if (existingRaster && existingRaster.filtersUsed && sameFilters(existingRaster.filtersUsed, currentFilters)) {
+        const existingRaster = createdRasters.find(r => r.aoiId === stableAoiIdForCheck && sameFilters(r.filtersUsed, currentFilters));
+        if (existingRaster) {
           console.log(`[MapExplorer] ⏭️ Skipping AOI ${aoi.name || aoi.id}: Already generated with same filters`);
           // Show toast notification (optional - user can still regenerate by changing filters)
           // Note: We skip generation but don't add to failedAois since it's intentional
@@ -1399,7 +1555,6 @@ export default function MapExplorer() {
       const result = await clipRaster({
         rasterLayerId,
         userClipGeoJSON: clipGeoJSON,
-          zoom: mapInstanceRef.current ? mapInstanceRef.current.getZoom() : null,
       });
 
         // ============================================================
@@ -1486,6 +1641,7 @@ export default function MapExplorer() {
       const newRaster = {
         id: `raster-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         name: createdRasterName,
+        label: rasterName, // concise label derived from filters
         createdAt: timestamp,
         overlayUrl: overlay,
         overlayBounds: boundsArray, // Store bounds in array format [[south, west], [north, east]]
@@ -1499,6 +1655,7 @@ export default function MapExplorer() {
         aoiName: aoiName,
         aoiType: aoi.type || "draw", // Store AOI type: "upload" or "draw"
         aoiGeojson: aoi.geojson, // Store AOI GeoJSON for export
+        isVisible: true,
         filtersUsed: {
           mapType,
           species,
@@ -1522,7 +1679,7 @@ export default function MapExplorer() {
       };
 
         // Upsert: Replace existing raster for this aoiId, or add new one
-        upsertCreatedRaster(newRaster);
+        addCreatedRaster(newRaster);
         successfulRasters.push(newRaster);
         console.log(`[MapExplorer] ✓ Successfully generated raster for AOI: ${aoiName}`);
       } catch (error) {
@@ -1908,6 +2065,34 @@ export default function MapExplorer() {
 
       // Set userClip to the first new AOI (for Generate button)
       if (newAois.length > 0) {
+        // ============================================================
+        // ENFORCE "ONLY ONE AOI" - Clear old AOI and all its data
+        // ============================================================
+        const oldActiveAoiId = activeAoiId;
+        
+        if (oldActiveAoiId && mapInstanceRef.current?._layerGroupManager) {
+          console.log(`[MapExplorer] Removing old active AOI ${oldActiveAoiId} before uploading new one`);
+          // Remove old AOI and all its rasters from map
+          mapInstanceRef.current._layerGroupManager.removeAoiAndAllRasters(oldActiveAoiId);
+        }
+        
+        // Clear all created rasters (overlays) for old AOI
+        setCreatedRasters([]);
+        setActiveRasterId(null);
+        setActiveCreatedRasterId(null);
+        setStats(null);
+        setPixelValues([]);
+        setHistogram(null);
+        
+        // Clear sessionStorage
+        try {
+          sessionStorage.removeItem("vmrc_created_rasters");
+          sessionStorage.removeItem("vmrc_active_created_raster_id");
+          sessionStorage.removeItem("vmrc_active_aoi_id");
+        } catch (err) {
+          console.error("[Session] Failed to clear sessionStorage:", err);
+        }
+        
         setUserClip(newAois[0].geojson);
         
         // ============================================================
@@ -1915,6 +2100,9 @@ export default function MapExplorer() {
         // User can change active AOI via dropdown later
         // ============================================================
         const firstAoi = newAois[0];
+        // ✅ Set activeAoiId as single source of truth
+        setActiveAoiId(firstAoi.id);
+        
         setActiveAoi({
           source: "uploaded",
           key: firstAoi.id,
@@ -2089,6 +2277,15 @@ export default function MapExplorer() {
     setCreatedRasters((prev) => {
       const filtered = prev.filter((r) => r.aoiId !== aoiId);
       console.log(`[MapExplorer] onRemoveRasterByAoiId: State updated - ${prev.length} -> ${filtered.length} rasters`);
+      
+      // ✅ CRITICAL: Update sessionStorage immediately to prevent rehydration
+      try {
+        sessionStorage.setItem("vmrc_created_rasters", JSON.stringify(filtered));
+        console.log(`[Session] Updated sessionStorage: removed rasters for AOI ${aoiId}, ${filtered.length} rasters remaining`);
+      } catch (err) {
+        console.error("[Session] Failed to update sessionStorage after removing rasters:", err);
+      }
+      
       return filtered;
     });
   }, []);
@@ -2105,14 +2302,43 @@ export default function MapExplorer() {
     
     console.log("[MapExplorer] handleAoiErased called with aoiId:", aoiId);
     
+    // ✅ CRITICAL: If this was the active AOI, clear sidebar state
+    const wasActiveAoi = aoiId === activeAoiId;
+    if (wasActiveAoi) {
+      console.log("[MapExplorer] Erased AOI was active - clearing sidebar state");
+      setActiveAoiId(null);
+      setActiveRasterId(null);
+      setActiveCreatedRasterId(null);
+      setStats(null);
+      setPixelValues([]);
+      setHistogram(null);
+      
+      // Clear sessionStorage
+      try {
+        sessionStorage.removeItem("vmrc_active_aoi_id");
+        sessionStorage.removeItem("vmrc_created_rasters");
+        sessionStorage.removeItem("vmrc_active_created_raster_id");
+      } catch (err) {
+        console.error("[Session] Failed to clear sessionStorage:", err);
+      }
+    }
+    
     // CRITICAL: Call handleRemoveAoi FIRST to ensure LayerGroupManager cleanup
-    // This removes AOI from state, clears refs, and triggers LayerGroupManager.deletePairByAoiId
+    // This removes AOI from state, clears refs, and triggers LayerGroupManager.removeAoiAndAllRasters
     handleRemoveAoi(aoiId);
     
     // Remove all created rasters with matching aoiId (overlays)
     setCreatedRasters((prev) => {
       const filtered = prev.filter((r) => r.aoiId !== aoiId);
       console.log(`[MapExplorer] Removed ${prev.length - filtered.length} raster(s) for erased AOI ${aoiId}`);
+      
+      // Update sessionStorage
+      try {
+        sessionStorage.setItem("vmrc_created_rasters", JSON.stringify(filtered));
+      } catch (err) {
+        console.error("[Session] Failed to update sessionStorage:", err);
+      }
+      
       return filtered;
     });
     
@@ -2143,11 +2369,11 @@ export default function MapExplorer() {
     }
     
     // Also call onRemoveRasterByAoiId if available (for LayerGroupManager)
-    // This is handled by LayerGroupManager's deletePairByAoiId, but we also clean up state here
+    // This is handled by LayerGroupManager's removeAoiAndAllRasters, but we also clean up state here
     if (onRemoveRasterByAoiId) {
       onRemoveRasterByAoiId(aoiId);
     }
-  }, [onRemoveRasterByAoiId]);
+  }, [onRemoveRasterByAoiId, activeAoiId]);
 
   // Remove a specific AOI by ID (called from erase tool or remove button)
   // NOTE: This does NOT remove AOI_diss (globalAoi) - that is permanent
@@ -2205,10 +2431,14 @@ export default function MapExplorer() {
   // CREATED RASTERS LIST HANDLERS
   // ======================================================
   function handleShowRaster(rasterId) {
-    // Set this raster as active (for histogram display)
-    // All rasters remain visible on map - this just changes which one's histogram is shown
+    // Set this raster as active (for histogram display and map overlay)
     const raster = createdRasters.find((r) => r.id === rasterId);
     if (!raster) return;
+
+    // Ensure raster is visible when activating
+    setCreatedRasters((prev) =>
+      prev.map((r) => (r.id === rasterId ? { ...r, isVisible: true } : r))
+    );
 
     // Set as active raster (updates histogram panel and click sampling)
     setActiveCreatedRasterId(rasterId); // Created raster ID (for histogram)
@@ -2219,8 +2449,55 @@ export default function MapExplorer() {
     setPixelValues(raster.pixelValues || []);
     setHistogram(raster.histogram);
 
-    // Note: All rasters remain visible on map - we don't clear other overlays
-    // The map will render all rasters from createdRasters array
+    // ✅ CRITICAL: Show this raster overlay on the map and hide others for the same AOI
+    if (mapInstanceRef.current && mapInstanceRef.current._layerGroupManager) {
+      const manager = mapInstanceRef.current._layerGroupManager;
+      
+      // If raster has aoiId, use setActiveRasterForAoi to hide others for same AOI
+      if (raster.aoiId) {
+        manager.setActiveRasterForAoi(raster.aoiId, rasterId);
+      } else {
+        // Fallback: just show this raster
+        manager.showRasterOverlay(rasterId);
+      }
+      
+      console.log(`[MapExplorer] ✅ Activated raster overlay: rasterId=${rasterId}, aoiId=${raster.aoiId}`);
+    } else {
+      console.warn("[MapExplorer] LayerGroupManager not available - overlay may not update");
+    }
+  }
+
+  function handleToggleRasterVisibility(rasterId) {
+    const raster = createdRasters.find((r) => r.id === rasterId);
+    if (!raster) return;
+    
+    const newVisibility = !raster.isVisible;
+    
+    // Update state
+    setCreatedRasters((prev) =>
+      prev.map((r) => (r.id === rasterId ? { ...r, isVisible: newVisibility } : r))
+    );
+
+    // ✅ CRITICAL: Show/hide overlay on map using LayerGroupManager
+    if (mapInstanceRef.current && mapInstanceRef.current._layerGroupManager) {
+      const manager = mapInstanceRef.current._layerGroupManager;
+      
+      if (newVisibility) {
+        // Show the overlay
+        if (raster.aoiId) {
+          manager.setActiveRasterForAoi(raster.aoiId, rasterId);
+        } else {
+          manager.showRasterOverlay(rasterId);
+        }
+        console.log(`[MapExplorer] ✅ Showed raster overlay: rasterId=${rasterId}`);
+      } else {
+        // Hide the overlay (but keep it in registry)
+        manager.hideRasterOverlay(rasterId);
+        console.log(`[MapExplorer] ✅ Hid raster overlay: rasterId=${rasterId}`);
+      }
+    } else {
+      console.warn("[MapExplorer] LayerGroupManager not available - overlay may not update");
+    }
   }
 
   async function handleRemoveRaster(rasterId) {
@@ -2248,7 +2525,14 @@ export default function MapExplorer() {
       }
     }
 
-    // Remove from list (this removes it from map automatically via LayerGroupManager)
+    // ✅ CRITICAL: Remove overlay from map using LayerGroupManager
+    if (mapInstanceRef.current && mapInstanceRef.current._layerGroupManager) {
+      const manager = mapInstanceRef.current._layerGroupManager;
+      manager.removeRasterOverlay(rasterId);
+      console.log(`[MapExplorer] ✅ Removed raster overlay from map: rasterId=${rasterId}`);
+    }
+
+    // Remove from list (this also triggers LayerGroupManager cleanup via useEffect)
     // CRITICAL: This removes ONLY the raster overlay, NOT the AOI
     // The AOI should remain visible - only the overlay is removed
     console.log(`[MapExplorer] handleRemoveRaster: Removing raster ${rasterId} (aoiId: ${aoiId}) from createdRasters state - AOI preserved`);
@@ -2281,6 +2565,51 @@ export default function MapExplorer() {
     }
   }
 
+  // ======================================================
+  // CLEAR ALL STATE (called by LayerGroupManager.clearAll)
+  // ======================================================
+  const onClearAll = useCallback(() => {
+    // CRITICAL GUARD: Do NOT clear overlays if export is active
+    if (isExportingRef.current) {
+      console.warn("[MapExplorer] ⚠️ BLOCKED: onClearAll called during export - export must not clear overlays");
+      return;
+    }
+
+    console.log("[MapExplorer] onClearAll: Resetting all state");
+    
+    // Clear all rasters from state
+    setCreatedRasters([]);
+    setActiveCreatedRasterId(null);
+    setActiveRasterId(null);
+    setStats(null);
+    setPixelValues([]);
+    setHistogram(null);
+    
+    // Clear active AOI
+    setActiveAoi({
+      source: null,
+      key: null,
+      geoJSON: null,
+      name: null,
+    });
+    
+    // Clear all AOIs
+    setAois([]);
+    setUploadedAois([]);
+    setUserClip(null);
+    userClipRef.current = null;
+    drawnAoiIdRef.current = null;
+    
+    // Clear sessionStorage
+    try {
+      sessionStorage.removeItem("vmrc_created_rasters");
+      sessionStorage.removeItem("vmrc_active_created_raster_id");
+      console.log("[Session] Cleared sessionStorage (Clear All)");
+    } catch (err) {
+      console.error("[Session] Failed to clear sessionStorage:", err);
+    }
+  }, []);
+
   async function handleClearAllRasters() {
     // CRITICAL GUARD: Do NOT clear overlays if export is active
     if (isExportingRef.current) {
@@ -2289,7 +2618,7 @@ export default function MapExplorer() {
       return; // Early return - do NOT clear overlays
     }
     
-    // Delete all overlay files from server
+    // Delete all overlay files from server first
     const deletePromises = createdRasters
       .filter((r) => r.overlayUrl)
       .map((r) => 
@@ -2300,35 +2629,16 @@ export default function MapExplorer() {
     
     await Promise.all(deletePromises);
     
-    // Clear all rasters from state
-    console.log("[CLEAR_OVERLAY] setCreatedRasters([]) called from handleClearAllRasters");
-    setCreatedRasters([]);
-    console.log("[CLEAR_OVERLAY] setActiveCreatedRasterId(null) called from handleClearAllRasters");
-    setActiveCreatedRasterId(null);
-    console.log("[CLEAR_OVERLAY] setActiveRasterId(null) called from handleClearAllRasters");
-    setActiveRasterId(null);
-    setStats(null);
-    setPixelValues([]);
-    setHistogram(null);
-    
-    // ============================================================
-    // CLEAR ACTIVE AOI when Clear All is pressed
-    // ============================================================
-    setActiveAoi({
-      source: null,
-      key: null,
-      geoJSON: null,
-      name: null,
-    });
-    console.log("[MapExplorer] Cleared active AOI (Clear All)");
-    
-    // Clear sessionStorage
-    try {
-      sessionStorage.removeItem("vmrc_created_rasters");
-      sessionStorage.removeItem("vmrc_active_created_raster_id");
-      console.log("[Session] Cleared sessionStorage (Clear All)");
-    } catch (err) {
-      console.error("[Session] Failed to clear sessionStorage:", err);
+    // ✅ CRITICAL: Call LayerGroupManager.clearAll() to remove all layers from map
+    // This will also call onClearAll() to reset React state
+    if (mapInstanceRef.current && mapInstanceRef.current._layerGroupManager) {
+      const manager = mapInstanceRef.current._layerGroupManager;
+      console.log("[MapExplorer] Calling LayerGroupManager.clearAll() to remove all layers from map");
+      manager.clearAll();
+    } else {
+      console.warn("[MapExplorer] LayerGroupManager not available - clearing state only");
+      // Fallback: just clear state if manager not available
+      onClearAll();
     }
     
     // Clear Geoman temp/hint layers
@@ -2453,14 +2763,27 @@ export default function MapExplorer() {
         .filter(([_, v]) => Boolean(v))
         .map(([k]) => k);
 
-      // Build filename from current filters (use current state, not stale)
-      // Note: Backend adds extensions automatically, so we pass filename without extension
-      // Format: {MapType}_{Species}_{Cover}_{Climate}_{Month}
-      // Example: HSL_DF_50_DRY_04
-      const generatedFilename = buildExportName(mapType, species, month, condition, coverPercent, hslCondition, "").replace(/\.\w+$/, "");
+      // Build filename from raster name (matches Raster Overview exactly)
+      // Use selectedRasterName as PRIMARY source (same value shown in "Raster Name:" in StatsTable)
+      // This is the ONLY source of truth for the export filename
+      let exportBaseName;
       
-      // Use generated filename if user didn't provide one
-      const exportFilename = (filename || "").trim() || generatedFilename;
+      // Priority 1: Use selectedRasterName (exactly what's shown in Raster Overview)
+      if (selectedRasterName) {
+        exportBaseName = getExportBaseFromRasterName(selectedRasterName);
+        console.log(`[Export] Using selectedRasterName (Raster Overview): ${selectedRasterName} -> ${exportBaseName}`);
+      } else if (selectedRasterPath) {
+        // Priority 2: Use selectedRasterPath (full path) if name not available
+        exportBaseName = getExportBaseFromRasterName(selectedRasterPath);
+        console.log(`[Export] Using selectedRasterPath: ${selectedRasterPath} -> ${exportBaseName}`);
+      } else {
+        // Last resort: build from filters if raster name not available
+        console.warn("[Export] selectedRasterName not available (Raster Overview), falling back to filter-based filename");
+        exportBaseName = buildExportName(mapType, species, month, condition, coverPercent, hslCondition, "").replace(/\.\w+$/, "");
+      }
+      
+      // Use user-provided filename if set, otherwise use raster base name
+      const exportFilename = (filename || "").trim() || exportBaseName;
 
       // Build context with filters, stats, histogram, bounds, and pixelValues
       // ✅ CRITICAL: Include stats from createdRaster so PDF matches UI
@@ -2512,7 +2835,14 @@ export default function MapExplorer() {
       const exportFiles = data.files || data;
       console.log("[Export] Export files:", exportFiles);
       
-      setExportResults(exportFiles);
+      // Store export context and raster name with results for filename generation on download
+      const exportResultsWithContext = {
+        ...exportFiles,
+        _exportContext: exportContext, // Store context for filename generation
+        _rasterBaseName: exportBaseName, // Store raster base name for download filenames
+      };
+      
+      setExportResults(exportResultsWithContext);
       
       // Note: Files are downloaded via download buttons in the UI
       // We don't auto-download here to avoid multiple downloads
@@ -2910,7 +3240,10 @@ export default function MapExplorer() {
                           e.stopPropagation();
                           try {
                             const url = apiUrl(exportResults.png);
-                            const downloadName = exportResults.png.split('/').pop() || 'export.png';
+                            // Use raster base name from export results, or extract from URL as fallback
+                            const baseName = exportResults._rasterBaseName || getExportBaseFromRasterName(exportResults.png.split('/').pop() || '') || 'export';
+                            const downloadName = `${baseName}.png`;
+                            console.log(`[Export] Downloading PNG as: ${downloadName}`);
                             await downloadBlob(url, downloadName);
                           } catch (err) {
                             console.error("[Export] Failed to download PNG:", err);
@@ -2939,7 +3272,10 @@ export default function MapExplorer() {
                           e.stopPropagation();
                           try {
                             const url = apiUrl(exportResults.tif);
-                            const downloadName = exportResults.tif.split('/').pop() || 'export.zip';
+                            // Use raster base name from export results, or extract from URL as fallback
+                            const baseName = exportResults._rasterBaseName || getExportBaseFromRasterName(exportResults.tif.split('/').pop() || '') || 'export';
+                            const downloadName = `${baseName}.zip`;
+                            console.log(`[Export] Downloading GeoTIFF (ZIP) as: ${downloadName}`);
                             await downloadBlob(url, downloadName);
                           } catch (err) {
                             console.error("[Export] Failed to download GeoTIFF:", err);
@@ -2968,7 +3304,10 @@ export default function MapExplorer() {
                           e.stopPropagation();
                           try {
                             const url = apiUrl(exportResults.geojson);
-                            const downloadName = exportResults.geojson.split('/').pop() || 'export.geojson';
+                            // Use raster base name from export results, or extract from URL as fallback
+                            const baseName = exportResults._rasterBaseName || getExportBaseFromRasterName(exportResults.geojson.split('/').pop() || '') || 'export';
+                            const downloadName = `${baseName}.geojson`;
+                            console.log(`[Export] Downloading GeoJSON as: ${downloadName}`);
                             await downloadBlob(url, downloadName);
                           } catch (err) {
                             console.error("[Export] Failed to download GeoJSON:", err);
@@ -2997,7 +3336,12 @@ export default function MapExplorer() {
                           e.stopPropagation();
                           try {
                             const url = apiUrl(exportResults.pdf);
-                            const downloadName = exportResults.pdf.split('/').pop() || 'export.pdf';
+                            
+                            // Use raster base name from export results (matches Raster Overview exactly)
+                            const baseName = exportResults._rasterBaseName || getExportBaseFromRasterName(exportResults.pdf.split('/').pop() || '') || 'export';
+                            const downloadName = `${baseName}.pdf`;
+                            console.log(`[Export] Downloading PDF as: ${downloadName}`);
+                            
                             await downloadBlob(url, downloadName);
                           } catch (err) {
                             console.error("[Export] Failed to download PDF:", err);
@@ -3217,6 +3561,7 @@ export default function MapExplorer() {
           onRemoveAoi={handleRemoveAoi}
           onRemoveRaster={handleRemoveRaster}
           onRemoveRasterByAoiId={onRemoveRasterByAoiId}
+          onClearAll={onClearAll}
           onDrawStart={handleStartNewAoi}
           onClearDrawnAoi={handleClearDrawnAoi}
           activeRasterId={activeRasterId}
@@ -3287,97 +3632,119 @@ export default function MapExplorer() {
                 </div>
               )}
               
-              {/* Stats table */}
-              {createdRasters.length === 0 ? (
-                <div style={{ padding: "20px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
-                  Generate a map to see statistics.
-                </div>
+              {/* Stats table - only show for active AOI */}
+              {activeAoiId ? (
+                (() => {
+                  const activeAoiRasters = createdRasters.filter(r => r.aoiId === activeAoiId);
+                  if (activeAoiRasters.length === 0) {
+                    return (
+                      <div style={{ padding: "20px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
+                        Generate a map to see statistics.
+                      </div>
+                    );
+                  }
+                  return (
+                    <>
+                      {/* Warning if stats are missing */}
+                      {activeCreatedRasterId && !stats && (
+                        <div style={{ 
+                          padding: "12px", 
+                          marginBottom: "16px", 
+                          backgroundColor: "#fef3c7", 
+                          border: "1px solid #fbbf24", 
+                          borderRadius: "4px",
+                          fontSize: "13px",
+                          color: "#92400e"
+                        }}>
+                          ⚠️ Statistics not available for this raster. The backend may not have returned stats in the generate response. Check the console for details.
+                        </div>
+                      )}
+                      <StatsTable
+                        stats={stats}
+                        values={pixelValues}
+                        rasterName={selectedRasterName || (activeCreatedRasterId ? activeAoiRasters.find(r => r.id === activeCreatedRasterId)?.name : null)}
+                        rasterPath={selectedRasterPath}
+                      />
+                    </>
+                  );
+                })()
               ) : (
-                <>
-                  {/* Warning if stats are missing */}
-                  {activeCreatedRasterId && !stats && (
-                    <div style={{ 
-                      padding: "12px", 
-                      marginBottom: "16px", 
-                      backgroundColor: "#fef3c7", 
-                      border: "1px solid #fbbf24", 
-                      borderRadius: "4px",
-                      fontSize: "13px",
-                      color: "#92400e"
-                    }}>
-                      ⚠️ Statistics not available for this raster. The backend may not have returned stats in the generate response. Check the console for details.
-                    </div>
-                  )}
-            <StatsTable
-              stats={stats}
-              values={pixelValues}
-                    rasterName={selectedRasterName || (activeCreatedRasterId ? createdRasters.find(r => r.id === activeCreatedRasterId)?.name : null)}
-              rasterPath={selectedRasterPath}
-            />
-                </>
+                <div style={{ padding: "20px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
+                  Draw or upload an AOI to begin.
+                </div>
               )}
             </>
           )}
           {activeTab === "histogram" && (
             <>
-              {/* Dropdown to select which AOI's histogram to display */}
-              {createdRasters.length > 0 && (
-                <div style={{ marginBottom: "16px" }}>
-                  <label style={{ display: "block", marginBottom: "6px", fontSize: "13px", fontWeight: 500, color: "#374151" }}>
-                    Histogram for AOI:
-                  </label>
-                  <select
-                    value={activeCreatedRasterId || ""}
-                    onChange={(e) => {
-                      const selectedId = e.target.value;
-                      if (selectedId) {
-                        handleShowRaster(selectedId);
-                      }
-                    }}
-              style={{
-                width: "100%",
-                      padding: "8px 12px",
-                      fontSize: "13px",
-                      border: "1px solid #d1d5db",
-                      borderRadius: "4px",
-                      backgroundColor: "#ffffff",
-                      color: "#111827",
-                    }}
-                  >
-                    {createdRasters.map((raster) => (
-                      <option key={raster.id} value={raster.id}>
-                        {raster.aoiName || raster.name || `AOI ${raster.aoiId}`}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              )}
-              
-              {/* Histogram shows data for active raster */}
-              {createdRasters.length === 0 ? (
-                <div style={{ padding: "20px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
-                  Generate a map to see histogram.
-                </div>
-              ) : activeCreatedRasterId && createdRasters.find((r) => r.id === activeCreatedRasterId) ? (
-                <HistogramPanel 
-                  values={pixelValues} 
-                  stats={stats} 
-                  histogram={histogram} 
-                />
+              {/* ✅ Show histogram only for active AOI */}
+              {activeAoiId ? (
+                <>
+                  {/* Show active AOI info (no dropdown - only one AOI at a time) */}
+                  {(() => {
+                    const activeAoiRasters = createdRasters.filter(r => r.aoiId === activeAoiId);
+                    const activeAoi = aois.find(a => a.id === activeAoiId) || uploadedAois.find(a => a.id === activeAoiId);
+                    return activeAoiRasters.length > 0 && (
+                      <div style={{ marginBottom: "16px" }}>
+                        <label style={{ display: "block", marginBottom: "6px", fontSize: "13px", fontWeight: 500, color: "#374151" }}>
+                          Active AOI:
+                        </label>
+                        <div style={{
+                          width: "100%",
+                          padding: "8px 12px",
+                          fontSize: "13px",
+                          border: "1px solid #d1d5db",
+                          borderRadius: "4px",
+                          backgroundColor: "#f9fafb",
+                          color: "#111827",
+                        }}>
+                          {activeAoi?.name || `AOI ${activeAoiId}`}
+                        </div>
+                      </div>
+                    );
+                  })()}
+                  
+                  {/* Histogram shows data for active raster of active AOI */}
+                  {(() => {
+                    const activeAoiRasters = createdRasters.filter(r => r.aoiId === activeAoiId);
+                    if (activeAoiRasters.length === 0) {
+                      return (
+                        <div style={{ padding: "20px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
+                          Generate a map to see histogram.
+                        </div>
+                      );
+                    }
+                    if (activeCreatedRasterId && activeAoiRasters.find((r) => r.id === activeCreatedRasterId)) {
+                      return (
+                        <HistogramPanel 
+                          values={pixelValues} 
+                          stats={stats} 
+                          histogram={histogram} 
+                        />
+                      );
+                    }
+                    return (
+                      <div style={{ padding: "20px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
+                        Select a raster from the list below to view its histogram.
+                      </div>
+                    );
+                  })()}
+                  
+                  {/* Created Rasters List - only show rasters for active AOI */}
+                  <CreatedRastersList
+                    rasters={createdRasters.filter(r => r.aoiId === activeAoiId)}
+                    activeRasterId={activeCreatedRasterId}
+                    onShowRaster={handleShowRaster}
+                    onToggleVisibility={handleToggleRasterVisibility}
+                    onRemoveRaster={handleRemoveRaster}
+                    onClearAll={createdRasters.filter(r => r.aoiId === activeAoiId).length > 0 ? handleClearAllRasters : null}
+                  />
+                </>
               ) : (
                 <div style={{ padding: "20px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
-                  Select a raster from the list below to view its histogram.
+                  Draw or upload an AOI to begin.
                 </div>
               )}
-              
-              {/* Created Rasters List - scrollable panel below histogram */}
-              <CreatedRastersList
-                rasters={createdRasters}
-                activeRasterId={activeCreatedRasterId}
-                onShowRaster={handleShowRaster}
-                onRemoveRaster={handleRemoveRaster}
-                onClearAll={createdRasters.length > 0 ? handleClearAllRasters : null}
-              />
             </>
           )}
         </div>
