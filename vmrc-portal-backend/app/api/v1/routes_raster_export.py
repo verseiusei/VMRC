@@ -400,8 +400,8 @@ def build_human_readable_raster_label(context: Optional[Dict[str, Any]]) -> str:
 
 def get_histogram_bin_ranges() -> List[str]:
     """Get histogram bin range labels with en dash (prevents Excel auto-formatting)."""
-    return ["0–10", "10–20", "20–30", "30–40", "40–50",
-            "50–60", "60–70", "70–80", "80–90", "90–100"]
+    return ["10", "20", "30", "40", "50",
+            "60", "70", "80", "90", "100"]
 
 
 def compute_expanded_stats(stats: Dict[str, Any], histogram: Optional[Dict[str, Any]] = None, valid_pixels: Optional[np.ndarray] = None) -> Dict[str, Any]:
@@ -637,7 +637,7 @@ def build_arcgis_metadata(context: Optional[Dict[str, Any]], raster_name: str) -
     tags = ", ".join(tags_list)
     
     # Credits
-    credits = "VMRC Project, University of Idaho"
+    credits = "VMRC Project"
     
     # Use limitations
     use_limitations = "For research and visualization purposes only."
@@ -1280,7 +1280,7 @@ def draw_pdf_header(canvas, doc, pagesize):
     canvas.setFillColorRGB(0.07, 0.07, 0.07)  # RGB(20,20,20) = dark gray
     title_text = "VMRC Mortality Calculation"
     title_width = canvas.stringWidth(title_text, "Helvetica-Bold", 16)
-    title_y = page_height - 35  # 35 points from top
+    title_y = page_height - 15  # 35 points from top
     title_x = (page_width - title_width) / 2  # Centered
     canvas.drawString(title_x, title_y, title_text)
     print(f"[PDF] ✓ Drew title: '{title_text}' at x={title_x:.1f}, y={title_y}")

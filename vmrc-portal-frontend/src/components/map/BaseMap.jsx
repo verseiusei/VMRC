@@ -35,6 +35,31 @@ import { sampleRasterValue, getRasterValueAt } from "../../lib/rasterApi";
 import RasterOverlay from "./RasterOverlay";
 import LayerGroupManager from "./LayerGroupManager";
 
+// Default bounds for initial West Coast view (applied once on mount)
+const DEFAULT_BOUNDS = [
+  [32.0, -130.0], // Southwest corner
+  [52.0, -105.0], // Northeast corner
+];
+
+// One-time bounds fitter to avoid re-zooming on state changes
+function InitialBoundsSetter() {
+  const map = useMap();
+  const didInitRef = useRef(false);
+
+  useEffect(() => {
+    if (!map || didInitRef.current) return;
+
+    try {
+      map.fitBounds(DEFAULT_BOUNDS, { padding: [20, 20] });
+      didInitRef.current = true;
+    } catch (err) {
+      console.warn("[BaseMap] Failed to apply initial bounds:", err);
+    }
+  }, [map]);
+
+  return null;
+}
+
 // ======================================================
 // AOI LAYER - Renders a single AOI (drawn or uploaded)
 // ======================================================
@@ -790,6 +815,79 @@ function InvalidateOnResize({ trigger }) {
 }
 
 // ======================================================
+// MAP STATUS BAR – Cursor coords only
+// ======================================================
+
+function formatCoords(lat, lng) {
+  if (lat == null || lng == null || !Number.isFinite(lat) || !Number.isFinite(lng)) return "—";
+  return `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+}
+
+function MapStatusBarControl() {
+  const map = useMap();
+  const controlRef = useRef(null);
+  const containerRef = useRef(null);
+  const lastLatLngRef = useRef({ lat: null, lng: null });
+
+  const updateDisplay = useCallback(() => {
+    if (!containerRef.current) return;
+    const { lat, lng } = lastLatLngRef.current;
+    const coords = formatCoords(lat, lng);
+    containerRef.current.innerHTML = `
+      <span class="map-status-item">${coords}</span>
+    `;
+  }, [map]);
+
+  useEffect(() => {
+    if (!map) return;
+    if (controlRef.current) return;
+
+    const StatusBarControl = L.Control.extend({
+      onAdd: function () {
+        const container = L.DomUtil.create("div", "leaflet-control map-status-bar");
+        container.style.pointerEvents = "none";
+        container.style.zIndex = "1000";
+        containerRef.current = container;
+        updateDisplay();
+        return container;
+      },
+      onRemove: function () {
+        containerRef.current = null;
+      },
+    });
+    const control = new StatusBarControl({ position: "bottomleft" });
+    control.addTo(map);
+    controlRef.current = control;
+    return () => {
+      if (controlRef.current && map) {
+        map.removeControl(controlRef.current);
+        controlRef.current = null;
+        containerRef.current = null;
+      }
+    };
+  }, [map, updateDisplay]);
+
+  useEffect(() => {
+    if (!map || !containerRef.current) return;
+
+    const onMouseMove = (e) => {
+      const lat = e?.latlng?.lat;
+      const lng = e?.latlng?.lng;
+      if (lat == null || lng == null || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
+      lastLatLngRef.current = { lat, lng };
+      updateDisplay();
+    };
+
+    map.on("mousemove", onMouseMove);
+    return () => {
+      map.off("mousemove", onMouseMove);
+    };
+  }, [map, updateDisplay]);
+
+  return null;
+}
+
+// ======================================================
 // CLICK SAMPLER – real .tif value, only after clip
 // ======================================================
 function ClickSampler({ activeRasterId, overlayBounds, onSample }) {
@@ -1361,6 +1459,8 @@ export default function BaseMap({
           height: "100%",
         }}
       >
+        {/* Apply initial zoomed-out West Coast view once on mount */}
+        <InitialBoundsSetter />
         {/* Basemap Layers */}
         <LayersControl position="topright">
           <LayersControl.BaseLayer checked name="Topographic">
@@ -1424,6 +1524,9 @@ export default function BaseMap({
           overlayUrl={overlayUrl}
           overlayBounds={overlayBounds}
         />
+
+        {/* Map status bar: coords only */}
+        <MapStatusBarControl />
 
         {/* Map ref handler */}
         <MapRefHandler onMapReady={onMapReady} />

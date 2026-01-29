@@ -268,9 +268,11 @@ export default function LayerGroupManager({
     }
 
     const BACKEND_BASE = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8000";
-    const fullUrl = overlayUrl.startsWith("http")
+    let fullUrl = overlayUrl.startsWith("http")
       ? overlayUrl
       : `${BACKEND_BASE}${overlayUrl}`;
+    // Cache-bust so each overlay has a unique URL and the browser doesn't reuse one image for all
+    fullUrl = fullUrl + (fullUrl.includes("?") ? "&" : "?") + "v=" + encodeURIComponent(rasterId);
 
     // Convert bounds to Leaflet format if needed
     let leafletBounds;
@@ -298,11 +300,18 @@ export default function LayerGroupManager({
       return null;
     }
 
-    // Create overlay layer
+    // Unique pane per overlay so Leaflet doesn't share/overwrite one layer
+    const paneName = "rasterPane_" + String(rasterId).replace(/[^a-zA-Z0-9-_]/g, "_").slice(0, 80);
+    if (!map.getPane(paneName)) {
+      const p = map.createPane(paneName);
+      p.style.zIndex = 200;
+    }
+
+    // Create overlay layer (unique URL + pane per raster)
     const overlay = L.imageOverlay(fullUrl, leafletBounds, {
       opacity: opacity,
       interactive: false,
-      pane: "rasterPane",
+      pane: paneName,
       className: "raster-overlay-pixelated",
     });
 
@@ -341,7 +350,8 @@ export default function LayerGroupManager({
     // Add to layer group
     overlayLayerGroupRef.current.addLayer(overlay);
 
-    console.log(`[LayerGroupManager] ✅ Registered raster overlay: rasterId=${rasterId}, aoiId=${aoiId}, opacity=${opacity}`);
+    const layerId = overlay._leaflet_id ?? "?";
+    console.log(`[LayerGroupManager] ✅ Registered raster overlay: aoiId=${aoiId}, rasterId=${rasterId}, layerId=${layerId}`);
     console.log(`[LayerGroupManager] Registry sizes: overlayByRasterId=${overlayByRasterId.current.size}, rasterIdsByAoiId=${rasterIdsByAoiId.current.size}`);
     
     return overlay;
@@ -968,6 +978,8 @@ export default function LayerGroupManager({
       return;
     }
 
+    const rasterCount = rasterIdsByAoiId.current.get(aoiId)?.size ?? 0;
+
     // ✅ CRITICAL: Remove ALL rasters for this AOI FIRST (before removing AOI layer)
     removeAllRastersForAoi(aoiId);
 
@@ -1005,7 +1017,7 @@ export default function LayerGroupManager({
 
     // Remove ALL rasters for this AOI from React state
     if (onRemoveRasterByAoiId && aoiId) {
-      console.log(`[LayerGroupManager] removeAoiAndAllRasters: Calling onRemoveRasterByAoiId(${aoiId}) to remove ${rasterIds.length} raster(s) from React state`);
+      console.log(`[LayerGroupManager] removeAoiAndAllRasters: Calling onRemoveRasterByAoiId(${aoiId}) to remove ${rasterCount} raster(s) from React state`);
       onRemoveRasterByAoiId(aoiId);
     }
     
@@ -1663,8 +1675,10 @@ export default function LayerGroupManager({
   }, [map, drawnAoi, removeAoiAndAllRasters, removeOverlayForAoiId, registerAoiLayer]);
 
   // ============================================================
-  // RENDER RASTER OVERLAYS AND REGISTER PAIRS
+  // RENDER RASTER OVERLAYS — SINGLE SOURCE OF TRUTH: createdRasters
   // ============================================================
+  // Map overlays are driven ONLY by createdRasters (same as Stats dropdown).
+  // Each visible raster gets its own Leaflet ImageOverlay; no single "current" overlay.
   useEffect(() => {
     console.log("[LayerGroupManager] 🔍 useEffect createdRasters triggered - count:", createdRasters?.length || 0);
     if (!map || !overlayLayerGroupRef.current) return;
@@ -1776,32 +1790,15 @@ export default function LayerGroupManager({
       // Also register in legacy setRasterOverlayForAoi for backward compatibility
       if (aoiId) {
         setRasterOverlayForAoi(aoiId, raster.id, overlay, leafletBounds);
-        
-        // Determine if this overlay should be shown
-        const activeRasterId = activeRasterByAoiId.current.get(aoiId);
-        const rasterSet = rasterIdsByAoiId.current.get(aoiId);
-        const isFirstRaster = !rasterSet || rasterSet.size === 1;
-        
-        if (activeRasterId === raster.id) {
-          // This is the active raster - show it
-          overlay.setOpacity(1.0);
-          overlay._hidden = false;
-        } else if (!activeRasterId && isFirstRaster) {
-          // No active raster yet and this is the first one - show it by default
-          overlay.setOpacity(1.0);
-          overlay._hidden = false;
-          activeRasterByAoiId.current.set(aoiId, raster.id);
-        } else {
-          // Another raster is active or this isn't the first - hide this one
-          overlay.setOpacity(0);
-          overlay._hidden = true;
-        }
-      } else {
-        console.warn(`[LayerGroupManager] ⚠️ Could not register overlay for raster ${raster.id}: missing aoiId`);
-        // Still show it if no aoiId (legacy support)
-        overlay.setOpacity(1.0);
-        overlay._hidden = false;
+        // Track most recent raster per AOI for Stats dropdown / showRasterOverlay
+        activeRasterByAoiId.current.set(aoiId, raster.id);
       }
+
+      // Show ALL visible rasters on the map (one per AOI or multiple per AOI).
+      // Single source of truth: createdRasters with isVisible !== false.
+      // Do NOT hide overlays based on "active" — map displays every visible raster.
+      overlay.setOpacity(1.0);
+      overlay._hidden = false;
     }
   }, [map, createdRasters, registerOverlay, removeOverlayForAoiId]);
 

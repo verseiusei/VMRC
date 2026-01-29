@@ -74,52 +74,52 @@
           "histogram": {
             "bins": [
               {
-                "range": "0-10",
+                "range": "10",
                 "count": 20015,
                 "percentage": 40.03
               },
               {
-                "range": "10-20",
+                "range": "20",
                 "count": 5510,
                 "percentage": 11.020000000000001
               },
               {
-                "range": "20-30",
+                "range": "30",
                 "count": 2811,
                 "percentage": 5.622
               },
               {
-                "range": "30-40",
+                "range": "40",
                 "count": 1849,
                 "percentage": 3.698
               },
               {
-                "range": "40-50",
+                "range": "50",
                 "count": 1501,
                 "percentage": 3.0020000000000002
               },
               {
-                "range": "50-60",
+                "range": "60",
                 "count": 1424,
                 "percentage": 2.848
               },
               {
-                "range": "60-70",
+                "range": "70",
                 "count": 1354,
                 "percentage": 2.708
               },
               {
-                "range": "70-80",
+                "range": "80",
                 "count": 1418,
                 "percentage": 2.836
               },
               {
-                "range": "80-90",
+                "range": "90",
                 "count": 1968,
                 "percentage": 3.936
               },
               {
-                "range": "90-100",
+                "range": "100",
                 "count": 12150,
                 "percentage": 24.3
               }

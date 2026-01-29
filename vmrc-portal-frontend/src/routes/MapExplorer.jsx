@@ -277,6 +277,24 @@ export default function MapExplorer() {
   }, [activeCreatedRasterId, createdRasters]);
 
   // ======================================================
+  // EFFECT: Sync histogram/Stats selection when selected raster is removed
+  // ======================================================
+  // If activeCreatedRasterId is missing from createdRasters (e.g. raster removed),
+  // fall back to first available raster so dropdown and panel stay valid.
+  // ======================================================
+  useEffect(() => {
+    if (createdRasters.length === 0) return;
+    const found = createdRasters.find((r) => r.id === activeCreatedRasterId);
+    if (found) return;
+    const first = createdRasters[0];
+    setActiveCreatedRasterId(first.id);
+    setActiveRasterId(first.activeRasterId);
+    setStats(first.stats || null);
+    setPixelValues(first.pixelValues || []);
+    setHistogram(first.histogram || null);
+  }, [createdRasters, activeCreatedRasterId]);
+
+  // ======================================================
   // EFFECT: Clear stale filter state when switching map type or species
   // ======================================================
   useEffect(() => {
@@ -627,7 +645,7 @@ export default function MapExplorer() {
     console.trace("[AOI_SET] handleUserClipChange(GeoJSON) - explicit user action");
 
     // Check for overlaps with existing selected AOIs
-    const overlapCheck = checkAoiOverlap(nextClip, selectedAois);
+    const overlapCheck = checkAoiOverlap(nextClip, aois);
     if (overlapCheck.overlaps) {
       alert(overlapCheck.message || "This AOI overlaps with an existing selected AOI. Please choose a different area.");
       // Don't add the AOI - user needs to draw a different one
@@ -1291,7 +1309,8 @@ export default function MapExplorer() {
       drawnAoiIdRef: drawnAoiIdRef.current,
     };
     console.log("[Generate] 🔍 START - Full state:", generateState);
-    
+    console.log("[Generate] activeAoiId:", activeAoi.id, "createdRasters keys:", createdRasters.map((r) => ({ id: r.id, aoiId: r.aoiId })));
+
     // ============================================================
     // CHECK AOI SOURCES (must check actual AOI state, not createdRasters)
     // ============================================================
@@ -1765,79 +1784,57 @@ export default function MapExplorer() {
   // ======================================================
   // OVERLAP DETECTION
   // ======================================================
-  // Checks if a new AOI geometry overlaps with any existing selected AOIs
-  // Uses Turf.js to compute intersection area
+  // Checks if a new AOI geometry overlaps with any existing AOIs (drawn + uploaded).
+  // Uses Turf.js geometry-level intersection; checks ALL features in new vs ALL in each existing.
   // Returns { overlaps: boolean, message: string }
   // ======================================================
-  function checkAoiOverlap(newGeojson, existingSelectedAois) {
-    if (!newGeojson || !existingSelectedAois || existingSelectedAois.length === 0) {
+  const OVERLAP_ERROR_MSG = "Uploaded AOI overlaps an existing AOI. Please upload a non-overlapping area.";
+
+  function checkAoiOverlap(newGeojson, existingAois) {
+    if (!newGeojson || !existingAois || existingAois.length === 0) {
       return { overlaps: false, message: null };
     }
 
+    const newFeatures = [];
+    if (newGeojson.type === "FeatureCollection" && newGeojson.features?.length) {
+      newFeatures.push(...newGeojson.features);
+    } else if (newGeojson.type === "Feature") {
+      newFeatures.push(newGeojson);
+    } else if (newGeojson.type === "Polygon" || newGeojson.type === "MultiPolygon") {
+      newFeatures.push({ type: "Feature", geometry: newGeojson, properties: {} });
+    }
+    if (newFeatures.length === 0) return { overlaps: false, message: null };
+
     try {
-      // Normalize new geometry to a Feature or FeatureCollection
-      let newFeature = null;
-      if (newGeojson.type === "FeatureCollection") {
-        // Use the first feature for overlap check
-        if (newGeojson.features.length === 0) {
-          return { overlaps: false, message: null };
+      for (const existingAoi of existingAois) {
+        const existingGeojson = existingAoi?.geojson;
+        if (!existingGeojson) continue;
+
+        const existingFeatures = [];
+        if (existingGeojson.type === "FeatureCollection" && existingGeojson.features?.length) {
+          existingFeatures.push(...existingGeojson.features);
+        } else if (existingGeojson.type === "Feature") {
+          existingFeatures.push(existingGeojson);
+        } else if (existingGeojson.type === "Polygon" || existingGeojson.type === "MultiPolygon") {
+          existingFeatures.push({ type: "Feature", geometry: existingGeojson, properties: {} });
         }
-        newFeature = newGeojson.features[0];
-      } else if (newGeojson.type === "Feature") {
-        newFeature = newGeojson;
-      } else if (newGeojson.type === "Polygon" || newGeojson.type === "MultiPolygon") {
-        newFeature = {
-          type: "Feature",
-          geometry: newGeojson,
-          properties: {},
-        };
-      } else {
-        return { overlaps: false, message: null };
-      }
 
-      // Check overlap with each existing selected AOI
-      for (const existingAoi of existingSelectedAois) {
-        try {
-          let existingFeature = null;
-          if (existingAoi.geojson.type === "FeatureCollection") {
-            if (existingAoi.geojson.features.length === 0) continue;
-            existingFeature = existingAoi.geojson.features[0];
-          } else if (existingAoi.geojson.type === "Feature") {
-            existingFeature = existingAoi.geojson;
-          } else if (existingAoi.geojson.type === "Polygon" || existingAoi.geojson.type === "MultiPolygon") {
-            existingFeature = {
-              type: "Feature",
-              geometry: existingAoi.geojson,
-              properties: {},
-            };
-          } else {
-            continue;
-          }
-
-          // Use Turf.js to compute intersection
-          const intersection = turf.intersect(newFeature, existingFeature);
-          
-          if (intersection) {
-            // Check if intersection has area > 0
-            const area = turf.area(intersection);
-            if (area > 0) {
-              return {
-                overlaps: true,
-                message: `This AOI overlaps with an existing selected AOI. Please choose a different area.`,
-              };
+        for (const nf of newFeatures) {
+          for (const ef of existingFeatures) {
+            try {
+              const intersection = turf.intersect(nf, ef);
+              if (intersection && turf.area(intersection) > 0) {
+                return { overlaps: true, message: OVERLAP_ERROR_MSG };
+              }
+            } catch (err) {
+              // No intersection or invalid geom – continue
             }
           }
-        } catch (err) {
-          // If intersection fails (e.g., geometries don't overlap), continue checking
-          console.log(`[Overlap check] No intersection with AOI ${existingAoi.id}:`, err.message);
-          continue;
         }
       }
-
       return { overlaps: false, message: null };
     } catch (err) {
-      console.error("[Overlap check] Error checking overlap:", err);
-      // If overlap check fails, allow the AOI (fail open)
+      console.error("[Overlap check] Error:", err);
       return { overlaps: false, message: null };
     }
   }
@@ -1992,9 +1989,10 @@ export default function MapExplorer() {
             };
             
             // Check for overlaps with existing AOIs
-            const overlapCheck = checkAoiOverlap(singleFeatureCollection, selectedAois);
+            const existingPlusNew = [...aois, ...newAois];
+            const overlapCheck = checkAoiOverlap(singleFeatureCollection, existingPlusNew);
             if (overlapCheck.overlaps) {
-              errors.push(`${file.name} #${i + 1}: ${overlapCheck.message || "Overlaps with existing AOI. Choose something else."}`);
+              errors.push(`${file.name} #${i + 1}: ${overlapCheck.message || OVERLAP_ERROR_MSG}`);
               continue;
             }
             
@@ -2017,9 +2015,10 @@ export default function MapExplorer() {
           }
         } else {
           // Single feature or single FeatureCollection - create one AOI
-          const overlapCheck = checkAoiOverlap(featureCollection, selectedAois);
+          const existingPlusNew = [...aois, ...newAois];
+          const overlapCheck = checkAoiOverlap(featureCollection, existingPlusNew);
           if (overlapCheck.overlaps) {
-            errors.push(`${file.name}: ${overlapCheck.message || "Overlaps with existing AOI. Choose something else."}`);
+            errors.push(`${file.name}: ${overlapCheck.message || OVERLAP_ERROR_MSG}`);
             continue;
           }
           
@@ -2051,7 +2050,10 @@ export default function MapExplorer() {
         };
       }
 
-      // Add to state (append, don't replace)
+      // ============================================================
+      // Multiple AOIs allowed: append new AOI(s) (overlap already rejected above)
+      // ============================================================
+      setAois((prev) => [...prev, ...newAois]);
       setUploadedAois((prev) => [...prev, ...newAois]);
       setSelectedAois((prev) => [
         ...prev,
@@ -2061,56 +2063,18 @@ export default function MapExplorer() {
           geojson: aoi.geojson,
         })),
       ]);
-      setAois((prev) => [...prev, ...newAois]);
+      persistentAoisRef.current = [...(persistentAoisRef.current || []), ...newAois];
 
-      // Set userClip to the first new AOI (for Generate button)
-      if (newAois.length > 0) {
-        // ============================================================
-        // ENFORCE "ONLY ONE AOI" - Clear old AOI and all its data
-        // ============================================================
-        const oldActiveAoiId = activeAoiId;
-        
-        if (oldActiveAoiId && mapInstanceRef.current?._layerGroupManager) {
-          console.log(`[MapExplorer] Removing old active AOI ${oldActiveAoiId} before uploading new one`);
-          // Remove old AOI and all its rasters from map
-          mapInstanceRef.current._layerGroupManager.removeAoiAndAllRasters(oldActiveAoiId);
-        }
-        
-        // Clear all created rasters (overlays) for old AOI
-        setCreatedRasters([]);
-        setActiveRasterId(null);
-        setActiveCreatedRasterId(null);
-        setStats(null);
-        setPixelValues([]);
-        setHistogram(null);
-        
-        // Clear sessionStorage
-        try {
-          sessionStorage.removeItem("vmrc_created_rasters");
-          sessionStorage.removeItem("vmrc_active_created_raster_id");
-          sessionStorage.removeItem("vmrc_active_aoi_id");
-        } catch (err) {
-          console.error("[Session] Failed to clear sessionStorage:", err);
-        }
-        
-        setUserClip(newAois[0].geojson);
-        
-        // ============================================================
-        // SET ACTIVE AOI to first uploaded AOI (default)
-        // User can change active AOI via dropdown later
-        // ============================================================
-        const firstAoi = newAois[0];
-        // ✅ Set activeAoiId as single source of truth
-        setActiveAoiId(firstAoi.id);
-        
-        setActiveAoi({
-          source: "uploaded",
-          key: firstAoi.id,
-          geoJSON: firstAoi.geojson, // Already normalized FeatureCollection
-          name: firstAoi.name || firstAoi._fileName || "Uploaded AOI",
-        });
-        console.log("[MapExplorer] Set active AOI to uploaded AOI:", firstAoi.id);
-      }
+      const firstAoi = newAois[0];
+      setUserClip(firstAoi.geojson);
+      setActiveAoiId(firstAoi.id);
+      setActiveAoi({
+        source: "uploaded",
+        id: firstAoi.id,
+        geoJSON: firstAoi.geojson,
+        name: firstAoi.name || firstAoi._fileName || "Uploaded AOI",
+      });
+      console.log("[MapExplorer] Upload AOI: added", newAois.length, "AOI(s), active set to:", firstAoi.id);
 
       return {
         success: true,
@@ -2290,90 +2254,58 @@ export default function MapExplorer() {
     });
   }, []);
 
-  // Handle when AOI is erased (called from BaseMap when user erases drawn AOI)
-  // This removes created rasters with matching aoiId from state AND removes AOI from state
+  // Erase ONE AOI: remove only that AOI and its created rasters (do not clear other AOIs).
   const handleAoiErased = useCallback((aoiId) => {
-    // CRITICAL GUARD: Do NOT clear overlays if export is active
     if (isExportingRef.current) {
-      console.warn("[MapExplorer] ⚠️ BLOCKED: handleAoiErased called during export - export must not clear overlays");
-      console.trace("[CLEAR_OVERLAY] ⚠️ BLOCKED: setCreatedRasters prevented during export");
-      return; // Early return - do NOT clear overlays
+      console.warn("[MapExplorer] ⚠️ BLOCKED: handleAoiErased during export");
+      return;
     }
-    
-    console.log("[MapExplorer] handleAoiErased called with aoiId:", aoiId);
-    
-    // ✅ CRITICAL: If this was the active AOI, clear sidebar state
+    console.log("[MapExplorer] handleAoiErased: removing single AOI", aoiId);
+
     const wasActiveAoi = aoiId === activeAoiId;
+
+    // 1) Remove AOI layers and raster overlays from map
+    if (mapInstanceRef.current?._layerGroupManager) {
+      mapInstanceRef.current._layerGroupManager.removeAoiAndAllRasters(aoiId);
+    }
+
+    // 2) Remove created rasters for this AOI only
+    onRemoveRasterByAoiId(aoiId);
+
+    // 3) Remove AOI from state (handleRemoveAoi clears refs if drawn)
+    handleRemoveAoi(aoiId);
+
+    // 4) If this was the active AOI, clear active state and optionally set another
     if (wasActiveAoi) {
-      console.log("[MapExplorer] Erased AOI was active - clearing sidebar state");
-      setActiveAoiId(null);
       setActiveRasterId(null);
       setActiveCreatedRasterId(null);
       setStats(null);
       setPixelValues([]);
       setHistogram(null);
-      
-      // Clear sessionStorage
       try {
         sessionStorage.removeItem("vmrc_active_aoi_id");
-        sessionStorage.removeItem("vmrc_created_rasters");
         sessionStorage.removeItem("vmrc_active_created_raster_id");
       } catch (err) {
         console.error("[Session] Failed to clear sessionStorage:", err);
       }
-    }
-    
-    // CRITICAL: Call handleRemoveAoi FIRST to ensure LayerGroupManager cleanup
-    // This removes AOI from state, clears refs, and triggers LayerGroupManager.removeAoiAndAllRasters
-    handleRemoveAoi(aoiId);
-    
-    // Remove all created rasters with matching aoiId (overlays)
-    setCreatedRasters((prev) => {
-      const filtered = prev.filter((r) => r.aoiId !== aoiId);
-      console.log(`[MapExplorer] Removed ${prev.length - filtered.length} raster(s) for erased AOI ${aoiId}`);
-      
-      // Update sessionStorage
-      try {
-        sessionStorage.setItem("vmrc_created_rasters", JSON.stringify(filtered));
-      } catch (err) {
-        console.error("[Session] Failed to update sessionStorage:", err);
+      const remaining = aois.filter((a) => a.id !== aoiId);
+      if (remaining.length > 0) {
+        const next = remaining[0];
+        setActiveAoiId(next.id);
+        setActiveAoi({
+          source: next.type === "upload" ? "uploaded" : "drawn",
+          id: next.id,
+          geoJSON: next.geojson,
+          name: next.name || (next.type === "upload" ? "Uploaded AOI" : "Drawn AOI"),
+        });
+        setUserClip(next.geojson);
+      } else {
+        setActiveAoiId(null);
+        setActiveAoi({ source: null, id: null, geoJSON: null, name: null });
+        setUserClip(null);
       }
-      
-      return filtered;
-    });
-    
-    // Clear drawn AOI refs if this was the drawn AOI (handleRemoveAoi does this, but ensure it's done)
-    const isDrawnAoi = drawnAoiIdRef.current === aoiId || persistentDrawnAoiIdRef.current === aoiId;
-    if (isDrawnAoi) {
-      console.log("[MapExplorer] 🗑️ EXPLICIT ERASE: Clearing drawn AOI refs for erased AOI");
-      console.trace("[AOI_CLEAR] handleAoiErased - explicit user action");
-      
-      drawnAoiIdRef.current = null;
-      userClipRef.current = null;
-      setUserClip(null);
-      
-      // CRITICAL: Also clear persistent refs (this is an explicit user action)
-      persistentDrawnAoiRef.current = null;
-      persistentDrawnAoiIdRef.current = null;
-      
-      // Also remove from aois array using the stable aoiId (handleRemoveAoi does this, but ensure it's done)
-      setAois((prev) => {
-        const filtered = prev.filter((a) => a.id !== aoiId);
-        persistentAoisRef.current = filtered; // Update persistent ref too
-        console.log(`[MapExplorer] Removed drawn AOI ${aoiId} from aois array: ${prev.length} -> ${filtered.length}`);
-        return filtered;
-      });
-      
-      // Remove from selectedAois
-      setSelectedAois((prev) => prev.filter((a) => a.id !== aoiId));
     }
-    
-    // Also call onRemoveRasterByAoiId if available (for LayerGroupManager)
-    // This is handled by LayerGroupManager's removeAoiAndAllRasters, but we also clean up state here
-    if (onRemoveRasterByAoiId) {
-      onRemoveRasterByAoiId(aoiId);
-    }
-  }, [onRemoveRasterByAoiId, activeAoiId]);
+  }, [activeAoiId, aois, onRemoveRasterByAoiId, handleRemoveAoi]);
 
   // Remove a specific AOI by ID (called from erase tool or remove button)
   // NOTE: This does NOT remove AOI_diss (globalAoi) - that is permanent
@@ -2575,7 +2507,7 @@ export default function MapExplorer() {
       return;
     }
 
-    console.log("[MapExplorer] onClearAll: Resetting all state");
+    console.log("[MapExplorer] onClearAll: Resetting all state (no AOI / no rasters)");
     
     // Clear all rasters from state
     setCreatedRasters([]);
@@ -2586,24 +2518,30 @@ export default function MapExplorer() {
     setHistogram(null);
     
     // Clear active AOI
+    setActiveAoiId(null);
     setActiveAoi({
       source: null,
-      key: null,
+      id: null,
       geoJSON: null,
       name: null,
     });
     
-    // Clear all AOIs
+    // Clear all AOIs and refs (full reset)
     setAois([]);
     setUploadedAois([]);
+    setSelectedAois([]);
     setUserClip(null);
     userClipRef.current = null;
     drawnAoiIdRef.current = null;
+    persistentDrawnAoiRef.current = null;
+    persistentDrawnAoiIdRef.current = null;
+    persistentAoisRef.current = [];
     
     // Clear sessionStorage
     try {
       sessionStorage.removeItem("vmrc_created_rasters");
       sessionStorage.removeItem("vmrc_active_created_raster_id");
+      sessionStorage.removeItem("vmrc_active_aoi_id");
       console.log("[Session] Cleared sessionStorage (Clear All)");
     } catch (err) {
       console.error("[Session] Failed to clear sessionStorage:", err);
@@ -3574,8 +3512,8 @@ export default function MapExplorer() {
         />
       </section>
 
-      {/* RIGHT PANEL */}
-      <SlidingPanel width={550}>
+      {/* RIGHT PANEL (fixed, narrower width) */}
+      <SlidingPanel width={380}>
         <div className="tab-bar">
           {tabs.map((t) => (
             <button
@@ -3677,72 +3615,62 @@ export default function MapExplorer() {
           )}
           {activeTab === "histogram" && (
             <>
-              {/* ✅ Show histogram only for active AOI */}
-              {activeAoiId ? (
+              {/* Histogram for: dropdown — same list as Stats / Created Rasters */}
+              {createdRasters.length > 0 ? (
                 <>
-                  {/* Show active AOI info (no dropdown - only one AOI at a time) */}
-                  {(() => {
-                    const activeAoiRasters = createdRasters.filter(r => r.aoiId === activeAoiId);
-                    const activeAoi = aois.find(a => a.id === activeAoiId) || uploadedAois.find(a => a.id === activeAoiId);
-                    return activeAoiRasters.length > 0 && (
-                      <div style={{ marginBottom: "16px" }}>
-                        <label style={{ display: "block", marginBottom: "6px", fontSize: "13px", fontWeight: 500, color: "#374151" }}>
-                          Active AOI:
-                        </label>
-                        <div style={{
-                          width: "100%",
-                          padding: "8px 12px",
-                          fontSize: "13px",
-                          border: "1px solid #d1d5db",
-                          borderRadius: "4px",
-                          backgroundColor: "#f9fafb",
-                          color: "#111827",
-                        }}>
-                          {activeAoi?.name || `AOI ${activeAoiId}`}
-                        </div>
-                      </div>
-                    );
-                  })()}
-                  
-                  {/* Histogram shows data for active raster of active AOI */}
-                  {(() => {
-                    const activeAoiRasters = createdRasters.filter(r => r.aoiId === activeAoiId);
-                    if (activeAoiRasters.length === 0) {
-                      return (
-                        <div style={{ padding: "20px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
-                          Generate a map to see histogram.
-                        </div>
-                      );
-                    }
-                    if (activeCreatedRasterId && activeAoiRasters.find((r) => r.id === activeCreatedRasterId)) {
-                      return (
-                        <HistogramPanel 
-                          values={pixelValues} 
-                          stats={stats} 
-                          histogram={histogram} 
-                        />
-                      );
-                    }
-                    return (
-                      <div style={{ padding: "20px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
-                        Select a raster from the list below to view its histogram.
-                      </div>
-                    );
-                  })()}
-                  
-                  {/* Created Rasters List - only show rasters for active AOI */}
+                  <div style={{ marginBottom: "16px" }}>
+                    <label style={{ display: "block", marginBottom: "6px", fontSize: "13px", fontWeight: 500, color: "#374151" }}>
+                      Histogram for:
+                    </label>
+                    <select
+                      value={activeCreatedRasterId || ""}
+                      onChange={(e) => {
+                        const selectedId = e.target.value;
+                        if (selectedId) handleShowRaster(selectedId);
+                      }}
+                      style={{
+                        width: "100%",
+                        padding: "8px 12px",
+                        fontSize: "13px",
+                        border: "1px solid #d1d5db",
+                        borderRadius: "4px",
+                        backgroundColor: "#ffffff",
+                        color: "#111827",
+                      }}
+                    >
+                      <option value="">Select a raster…</option>
+                      {createdRasters.map((raster) => (
+                        <option key={raster.id} value={raster.id}>
+                          {raster.name || raster.aoiName || `Raster ${raster.id}`}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  {/* Show histogram for selected raster */}
+                  {activeCreatedRasterId && createdRasters.find((r) => r.id === activeCreatedRasterId) ? (
+                    <HistogramPanel
+                      values={pixelValues}
+                      stats={stats}
+                      histogram={histogram}
+                    />
+                  ) : (
+                    <div style={{ padding: "20px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
+                      Select a raster from the dropdown above to view its histogram.
+                    </div>
+                  )}
+                  {/* Created Rasters list — all rasters (Show/Hide/Remove) */}
                   <CreatedRastersList
-                    rasters={createdRasters.filter(r => r.aoiId === activeAoiId)}
+                    rasters={createdRasters}
                     activeRasterId={activeCreatedRasterId}
                     onShowRaster={handleShowRaster}
                     onToggleVisibility={handleToggleRasterVisibility}
                     onRemoveRaster={handleRemoveRaster}
-                    onClearAll={createdRasters.filter(r => r.aoiId === activeAoiId).length > 0 ? handleClearAllRasters : null}
+                    onClearAll={createdRasters.length > 0 ? handleClearAllRasters : null}
                   />
                 </>
               ) : (
                 <div style={{ padding: "20px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
-                  Draw or upload an AOI to begin.
+                  Generate a raster to view a histogram.
                 </div>
               )}
             </>

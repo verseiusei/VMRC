@@ -17,6 +17,21 @@ export const API_BASE = API_BASE_URL;
 console.log("[rasterApi] API_BASE_URL =", API_BASE_URL);
 
 /**
+ * Elevation at (lat, lng). Backend: GET /api/v1/elevation?lat=..&lng=..
+ * Returns { elevation_ft: number | null, elevation_m: number | null } or null on failure.
+ */
+export async function fetchElevation(lat, lng) {
+  const url = apiUrl(`/api/v1/elevation?lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}`);
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const data = await res.json();
+  return {
+    elevation_ft: data.elevation_ft ?? null,
+    elevation_m: data.elevation_m ?? null,
+  };
+}
+
+/**
  * Get the global AOI GeoJSON from the backend.
  * Backend endpoint: GET /api/v1/aoi
  */
