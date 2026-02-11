@@ -75,38 +75,26 @@ export default function StatsTable({ stats, values, rasterName, rasterPath }) {
     ...(hasStats ? stats : {}),
   };
 
-  // Compute threshold area percentages
-  const thresholdStats = hasValues
-    ? {
-        pct70Plus: (numericValues.filter((v) => v >= 70).length / numericValues.length) * 100,
-        pct50Plus: (numericValues.filter((v) => v >= 50).length / numericValues.length) * 100,
-        pct30Minus: (numericValues.filter((v) => v <= 30).length / numericValues.length) * 100,
-      }
-    : { pct70Plus: null, pct50Plus: null, pct30Minus: null };
-
-  // Compute dominant bin (same bins as histogram: 0-10, 10-20, ..., 90-100)
-  const binCounts = new Array(10).fill(0);
-  if (hasValues) {
-    numericValues.forEach((v) => {
-      const clamped = Math.max(0, Math.min(100, v));
-      const idx = clamped === 100 ? 9 : Math.max(0, Math.min(9, Math.floor(clamped / 10)));
-      binCounts[idx] += 1;
-    });
-  }
-  const totalPixels = binCounts.reduce((a, b) => a + b, 0) || 1;
-  const maxBinCount = Math.max(...binCounts);
-  const dominantBinIndex = binCounts.indexOf(maxBinCount);
-  const dominantBinRange =
-    dominantBinIndex === 9
-      ? "90–100"
-      : `${dominantBinIndex * 10}–${(dominantBinIndex + 1) * 10}`;
-  const dominantBinShare = (maxBinCount / totalPixels) * 100;
-
-  // Format number helper
-  const fmt = (val, decimals = 2) => {
+  // Format number helper: one decimal place for Statistics page (reviewer requirement)
+  const fmt = (val, decimals = 1) => {
     if (val === null || val === undefined || isNaN(val)) return "--";
     return Number(val).toFixed(decimals);
   };
+
+  // Area by Mortality Class: fixed ranges 0–20, 20–40, 40–60, 60–80, 80–100 (percent of pixels in each)
+  const mortalityClassRanges = [
+    { label: "0–20", min: 0, max: 20 },
+    { label: "20–40", min: 20, max: 40 },
+    { label: "40–60", min: 40, max: 60 },
+    { label: "60–80", min: 60, max: 80 },
+    { label: "80–100", min: 80, max: 100 },
+  ];
+  const mortalityClassPcts = hasValues
+    ? mortalityClassRanges.map(({ min, max }) => {
+        const inRange = numericValues.filter((v) => v >= min && (max === 100 ? v <= max : v < max)).length;
+        return (inRange / numericValues.length) * 100;
+      })
+    : mortalityClassRanges.map(() => null);
 
   return (
     <div className="panel-body" style={{ padding: "12px", width: "100%" }}>
@@ -186,7 +174,7 @@ export default function StatsTable({ stats, values, rasterName, rasterPath }) {
             lineHeight: 1.4,
           }}
         >
-          Statistical measures computed from all pixel values within the selected area of interest.
+          Total area and seedling mortality statistics within the selected area of interest (acres).
         </p>
         <table
           style={{
@@ -195,18 +183,31 @@ export default function StatsTable({ stats, values, rasterName, rasterPath }) {
             fontSize: 12,
           }}
         >
+          <thead>
+            <tr>
+              <td style={{ padding: "6px 8px", color: "#6b7280", fontWeight: 600 }} />
+              <td style={{ padding: "6px 8px", textAlign: "right", color: "#374151", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                Area (%)
+              </td>
+            </tr>
+          </thead>
           <tbody>
             <tr>
               <td style={{ padding: "6px 8px", color: "#6b7280", fontWeight: 600 }}>
-                Total Pixels
+                Total Acres
               </td>
               <td style={{ padding: "6px 8px", textAlign: "right", color: "#111827", fontWeight: 600 }}>
-                {finalStats.count?.toLocaleString() || "--"}
+                {finalStats.count != null ? fmt(finalStats.count) : "--"}
+              </td>
+            </tr>
+            <tr>
+              <td colSpan={2} style={{ padding: "8px 8px 4px 8px", color: "#374151", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                Seedling Mortality (%)
               </td>
             </tr>
             <tr>
               <td style={{ padding: "6px 8px", color: "#6b7280", fontWeight: 600 }}>
-                Minimum Value
+                Minimum
               </td>
               <td style={{ padding: "6px 8px", textAlign: "right", color: "#111827", fontWeight: 600 }}>
                 {fmt(finalStats.min)}
@@ -214,7 +215,7 @@ export default function StatsTable({ stats, values, rasterName, rasterPath }) {
             </tr>
             <tr>
               <td style={{ padding: "6px 8px", color: "#6b7280", fontWeight: 600 }}>
-                Maximum Value
+                Maximum
               </td>
               <td style={{ padding: "6px 8px", textAlign: "right", color: "#111827", fontWeight: 600 }}>
                 {fmt(finalStats.max)}
@@ -222,7 +223,7 @@ export default function StatsTable({ stats, values, rasterName, rasterPath }) {
             </tr>
             <tr>
               <td style={{ padding: "6px 8px", color: "#6b7280", fontWeight: 600 }}>
-                Average (Mean)
+                Average
               </td>
               <td style={{ padding: "6px 8px", textAlign: "right", color: "#111827", fontWeight: 600 }}>
                 {fmt(finalStats.mean)}
@@ -230,7 +231,7 @@ export default function StatsTable({ stats, values, rasterName, rasterPath }) {
             </tr>
             <tr>
               <td style={{ padding: "6px 8px", color: "#6b7280", fontWeight: 600 }}>
-                Median Value
+                Median
               </td>
               <td style={{ padding: "6px 8px", textAlign: "right", color: "#111827", fontWeight: 600 }}>
                 {fmt(finalStats.median)}
@@ -238,7 +239,7 @@ export default function StatsTable({ stats, values, rasterName, rasterPath }) {
             </tr>
             <tr>
               <td style={{ padding: "6px 8px", color: "#6b7280", fontWeight: 600 }}>
-                Variability (Std. Dev)
+                Std. Dev
               </td>
               <td style={{ padding: "6px 8px", textAlign: "right", color: "#111827", fontWeight: 600 }}>
                 {fmt(finalStats.std)}
@@ -248,7 +249,7 @@ export default function StatsTable({ stats, values, rasterName, rasterPath }) {
         </table>
       </div>
 
-      {/* C) Area by Threshold */}
+      {/* C) Area by Mortality Class */}
       <div
         style={{
           marginBottom: 20,
@@ -268,7 +269,7 @@ export default function StatsTable({ stats, values, rasterName, rasterPath }) {
             letterSpacing: "0.5px",
           }}
         >
-          Area by Threshold
+          Area by Mortality Class
         </h4>
         <p
           style={{
@@ -279,92 +280,34 @@ export default function StatsTable({ stats, values, rasterName, rasterPath }) {
             lineHeight: 1.4,
           }}
         >
-          Percentage of pixels that fall within specific value ranges.
+          Percentage of area in each seedling mortality class within the selected AOI.
         </p>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+          <thead>
+            <tr>
+              <td style={{ padding: "6px 8px", color: "#374151", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                Seedling Mortality (%)
+              </td>
+              <td style={{ padding: "6px 8px", textAlign: "right", color: "#374151", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                Area (%)
+              </td>
+            </tr>
+          </thead>
           <tbody>
-            <tr>
-              <td style={{ padding: "6px 8px", color: "#6b7280", fontWeight: 600 }}>
-                High Values (≥ 70)
-              </td>
-              <td style={{ padding: "6px 8px", textAlign: "right", color: "#111827", fontWeight: 600 }}>
-                {fmt(thresholdStats.pct70Plus)}%
-              </td>
-            </tr>
-            <tr>
-              <td style={{ padding: "6px 8px", color: "#6b7280", fontWeight: 600 }}>
-                Moderate–High Values (≥ 50)
-              </td>
-              <td style={{ padding: "6px 8px", textAlign: "right", color: "#111827", fontWeight: 600 }}>
-                {fmt(thresholdStats.pct50Plus)}%
-              </td>
-            </tr>
-            <tr>
-              <td style={{ padding: "6px 8px", color: "#6b7280", fontWeight: 600 }}>
-                Low Values (≤ 30)
-              </td>
-              <td style={{ padding: "6px 8px", textAlign: "right", color: "#111827", fontWeight: 600 }}>
-                {fmt(thresholdStats.pct30Minus)}%
-              </td>
-            </tr>
+            {mortalityClassRanges.map((range, i) => (
+              <tr key={range.label}>
+                <td style={{ padding: "6px 8px", color: "#6b7280", fontWeight: 600 }}>
+                  {range.label}
+                </td>
+                <td style={{ padding: "6px 8px", textAlign: "right", color: "#111827", fontWeight: 600 }}>
+                  {mortalityClassPcts[i] != null ? fmt(mortalityClassPcts[i]) : "--"}
+                </td>
+              </tr>
+            ))}
           </tbody>
         </table>
       </div>
 
-      {/* D) Most Common Value Range */}
-      <div
-        style={{
-          marginBottom: 20,
-          padding: "12px",
-          background: "#f9fafb",
-          border: "1px solid #e5e7eb",
-          borderRadius: 0,
-        }}
-      >
-        <h4
-          style={{
-            color: "#374151",
-            fontSize: 13,
-            fontWeight: 700,
-            marginBottom: 4,
-            textTransform: "uppercase",
-            letterSpacing: "0.5px",
-          }}
-        >
-          Most Common Value Range
-        </h4>
-        <p
-          style={{
-            fontSize: 11,
-            color: "#9ca3af",
-            marginBottom: 12,
-            marginTop: 0,
-            lineHeight: 1.4,
-          }}
-        >
-          The value range that contains the most pixels in the selected area.
-        </p>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-          <tbody>
-            <tr>
-              <td style={{ padding: "6px 8px", color: "#6b7280", fontWeight: 600 }}>
-                Dominant Range
-              </td>
-              <td style={{ padding: "6px 8px", textAlign: "right", color: "#111827", fontWeight: 600 }}>
-                {dominantBinRange}
-              </td>
-            </tr>
-            <tr>
-              <td style={{ padding: "6px 8px", color: "#6b7280", fontWeight: 600 }}>
-                Coverage
-              </td>
-              <td style={{ padding: "6px 8px", textAlign: "right", color: "#111827", fontWeight: 600 }}>
-                {fmt(dominantBinShare)}%
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
     </div>
   );
 }

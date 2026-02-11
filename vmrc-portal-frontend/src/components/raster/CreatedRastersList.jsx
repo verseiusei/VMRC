@@ -30,36 +30,78 @@ const LEGEND_LABELS = [
   "90–100",
 ];
 
-// Small legend bar component
+// Helpers for metadata display (match MapExplorer logic)
+function getMonthName(monthCode) {
+  const monthMap = { "04": "April", "05": "May", "06": "June", "07": "July", "08": "August", "09": "September" };
+  return monthMap[monthCode] || monthCode;
+}
+function getStressDisplayName(stressCode) {
+  const stressMap = { l: "Low", ml: "Medium-Low", m: "Medium", mh: "Medium-High", h: "High", vh: "Very High" };
+  return stressMap[stressCode] || stressCode;
+}
+
+// Build metadata rows from raster.filtersUsed / raster.meta (exact order per spec)
+function getMetadataRows(raster) {
+  const f = raster?.filtersUsed || raster?.meta || {};
+  const mapType = f.mapType || (f.timeOfYear === "HSL" ? "hsl" : "mortality");
+  const stressLabel = mapType === "hsl" ? getStressDisplayName(f.hslClass || "m") : (f.dfStress || "—");
+  const timeLabel = f.timeOfYear === "HSL" ? "High Stress Level" : getMonthName(f.month || "04");
+  const climateLabel = mapType === "hsl"
+    ? ({ D: "Dry", W: "Wet", N: "Normal" }[f.hslCondition] || f.hslCondition || "—")
+    : (f.condition || "—");
+  return [
+    { label: "Species", value: f.species || "—" },
+    { label: "Seedling Drought Resistance Category", value: stressLabel },
+    { label: "Time of the Year", value: timeLabel },
+    { label: "Climate Scenario", value: climateLabel },
+    { label: "Maximum Vegetation Cover (%)", value: f.coverPercent != null ? String(f.coverPercent) : "—" },
+  ];
+}
+
+// Color bar with range labels above each segment (0–10, 10–20, …)
 function LegendBar({ ramp }) {
-  // Use provided ramp if available, otherwise use default
   const colors = ramp?.colors || LEGEND_COLORS;
   const labels = ramp?.labels || LEGEND_LABELS;
 
   return (
-    <div
-      style={{
-        display: "flex",
-        height: "20px",
-        borderRadius: "2px",
-        overflow: "hidden",
-        border: "1px solid #e5e7eb",
-        marginTop: "8px",
-      }}
-    >
-      {colors.map((color, i) => (
-        <div
-          key={i}
-          style={{
-            flex: 1,
-            backgroundColor: color,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-          title={labels[i] || `${i * 10}–${(i + 1) * 10}`}
-        />
-      ))}
+    <div style={{ marginTop: "8px" }}>
+      {/* Range labels row above the bar */}
+      <div
+        style={{
+          display: "flex",
+          marginBottom: "2px",
+          fontSize: "8px",
+          fontWeight: 600,
+          color: "#374151",
+          lineHeight: 1,
+        }}
+      >
+        {labels.map((lbl, i) => (
+          <div key={i} style={{ flex: 1, textAlign: "center", overflow: "hidden" }} title={lbl}>
+            {lbl}
+          </div>
+        ))}
+      </div>
+      <div
+        style={{
+          display: "flex",
+          height: "20px",
+          borderRadius: "2px",
+          overflow: "hidden",
+          border: "1px solid #e5e7eb",
+        }}
+      >
+        {colors.map((color, i) => (
+          <div
+            key={i}
+            style={{
+              flex: 1,
+              backgroundColor: color,
+            }}
+            title={labels[i] || `${i * 10}–${(i + 1) * 10}`}
+          />
+        ))}
+      </div>
     </div>
   );
 }
@@ -85,40 +127,52 @@ function RasterItem({ raster, isActive, onShow, onToggleVisibility, onRemove }) 
 
   return (
     <div
-      className={`raster-item ${isActive ? "raster-item-active" : ""}`}
+      className={`raster-item raster-card ${isActive ? "raster-item-active" : ""}`}
       style={{
         padding: "10px",
         border: `1px solid ${isActive ? "#2563eb" : "#e5e7eb"}`,
         borderRadius: "4px",
         backgroundColor: isActive ? "#eff6ff" : "#ffffff",
         marginBottom: "8px",
+        display: "flex",
+        flexDirection: "column",
       }}
     >
-      {/* Name */}
-      <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: "8px" }}>
-        <div
-          style={{
-            fontSize: "13px",
-            fontWeight: 600,
-            color: "#111827",
-            wordBreak: "break-word",
-          }}
-        >
-          {raster.label || raster.name}
-        </div>
-        <div style={{ fontSize: 11, color: "#6b7280" }}>
-          {raster.name}
-        </div>
+      {/* Metadata box: filter + value pairs (no redundant header; metadata is the identity) */}
+      <div
+        style={{
+          marginBottom: "8px",
+          padding: "8px 10px",
+          background: "#f9fafb",
+          border: "1px solid #e5e7eb",
+          borderRadius: 0,
+        }}
+      >
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+          <tbody>
+            {getMetadataRows(raster).map(({ label, value }) => (
+              <tr key={label}>
+                <td style={{ padding: "2px 6px 2px 0", color: "#6b7280", fontWeight: 600, verticalAlign: "top", width: "52%" }}>
+                  {label}
+                </td>
+                <td style={{ padding: "2px 0", color: "#111827", fontWeight: 500 }}>
+                  {value}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
 
-      {/* PNG Thumbnail with checkerboard background */}
+      {/* Raster preview: fills available space within card */}
       {overlayImageUrl && (
         <div
-          className="raster-thumbnail-container"
+          className="raster-thumbnail-container raster-preview-wrap"
           onClick={onShow}
           style={{
             cursor: "pointer",
             marginBottom: "8px",
+            width: "100%",
           }}
           title="Click to activate this raster"
         >
@@ -235,14 +289,18 @@ export default function CreatedRastersList({
 
   return (
     <div
+      className="created-rasters-list-root"
       style={{
-        maxHeight: "400px",
-        overflowY: "auto",
+        display: "flex",
+        flexDirection: "column",
+        height: "100%",
+        minHeight: 0,
         padding: "12px",
       }}
     >
       <div
         style={{
+          flexShrink: 0,
           display: "flex",
           justifyContent: "space-between",
           alignItems: "center",
@@ -279,32 +337,34 @@ export default function CreatedRastersList({
         )}
       </div>
 
-      {Object.values(
-        rasters.reduce((acc, r) => {
-          const key = r.aoiId || "unknown";
-          if (!acc[key]) {
-            acc[key] = { aoiId: key, aoiName: r.aoiName || `AOI ${key}`, items: [] };
-          }
-          acc[key].items.push(r);
-          return acc;
-        }, {})
-      ).map((group) => (
-        <div key={group.aoiId} style={{ marginBottom: "14px" }}>
-          <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8, color: "#111827" }}>
-            {group.aoiName}
+      <div className="created-rasters-list-scroll">
+        {Object.values(
+          rasters.reduce((acc, r) => {
+            const key = r.aoiId || "unknown";
+            if (!acc[key]) {
+              acc[key] = { aoiId: key, aoiName: r.aoiName || `AOI ${key}`, items: [] };
+            }
+            acc[key].items.push(r);
+            return acc;
+          }, {})
+        ).map((group) => (
+          <div key={group.aoiId} style={{ marginBottom: "14px" }}>
+            <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8, color: "#111827" }}>
+              {group.aoiName}
+            </div>
+            {group.items.map((raster) => (
+              <RasterItem
+                key={raster.id}
+                raster={raster}
+                isActive={raster.id === activeRasterId}
+                onShow={() => onShowRaster(raster.id)}
+                onToggleVisibility={() => onToggleVisibility?.(raster.id)}
+                onRemove={() => onRemoveRaster(raster.id)}
+              />
+            ))}
           </div>
-          {group.items.map((raster) => (
-            <RasterItem
-              key={raster.id}
-              raster={raster}
-              isActive={raster.id === activeRasterId}
-              onShow={() => onShowRaster(raster.id)}
-              onToggleVisibility={() => onToggleVisibility?.(raster.id)}
-              onRemove={() => onRemoveRaster(raster.id)}
-            />
-          ))}
-        </div>
-      ))}
+        ))}
+      </div>
     </div>
   );
 }

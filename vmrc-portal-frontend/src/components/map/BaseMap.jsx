@@ -361,6 +361,8 @@ function MapTools({ onUserClipChange, onRemoveAoi, aois = [], onDrawStart = null
       clearPreviousAoiLayer();
       // Also clear any other drawn layers
       clearDrawnAoiLayers();
+      // Clear created rasters list and overlays so only rasters from the new AOI will appear
+      if (onDrawStart) onDrawStart();
     };
 
     // Listen for draw start events (when polygon/rectangle tool is activated)
@@ -632,7 +634,7 @@ function LegendControl() {
         // Build static legend HTML - always show bins, no conditional content
         const legendHTML = `
           <div class="legend-card">
-            <div class="legend-title">Value (%)</div>
+            <div class="legend-title">Mortality (%)</div>
             ${LEGEND_ITEMS.map((item) => `
               <div class="legend-row">
                 <span class="legend-swatch" style="background-color: ${item.color}; pointer-events: none;"></span>
@@ -1083,9 +1085,9 @@ function RasterHoverTooltip({ activeRasterId, createdRasters = [], activeCreated
   const throttleDelay = 100; // Throttle requests to every 100ms
   const queryCacheRef = useRef(new Map()); // Cache queries by rounded lat/lng
 
-  // Find active raster from createdRasters
-  const activeRaster = createdRasters.find(r => r.id === activeCreatedRasterId) || 
-                       (createdRasters.length > 0 ? createdRasters[0] : null);
+  // Find active raster from createdRasters; default to newest (last) so we don't flash to #1
+  const activeRaster = createdRasters.find(r => r.id === activeCreatedRasterId) ||
+                       (createdRasters.length > 0 ? createdRasters[createdRasters.length - 1] : null);
   
   // Get overlay bounds from active raster
   const overlayBounds = activeRaster?.overlayBounds || null;
@@ -1542,7 +1544,7 @@ export default function BaseMap({
         <RasterHoverTooltipWrapper
           activeRasterId={activeRasterId}
           createdRasters={createdRasters}
-          activeCreatedRasterId={activeCreatedRasterId || (createdRasters.length > 0 ? createdRasters[0].id : null)}
+          activeCreatedRasterId={activeCreatedRasterId || (createdRasters.length > 0 ? createdRasters[createdRasters.length - 1].id : null)}
         />
 
         {/* Fix map disappearing when panels open/close */}

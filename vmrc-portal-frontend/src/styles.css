@@ -27,8 +27,8 @@ body {
 ------------------------------------------------------- */
 
 .app-header {
-  height: 100px;              /* Increased to accommodate larger logos */
-  min-height: 100px;
+  height: 120px;              /* Accommodate larger title and logos */
+  min-height: 120px;
   background: #ffffff;
   color: #1e293b;
   display: flex;
@@ -48,8 +48,8 @@ body {
 
 /* left & right logo areas */
 .app-header-side {
-  width: 180px;              /* Increased width to accommodate larger logos */
-  min-width: 140px;          /* Responsive minimum */
+  width: 220px;              /* Width for larger logos (e.g. Oregon.jpg) */
+  min-width: 160px;          /* Responsive minimum */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -67,7 +67,7 @@ body {
 }
 
 .app-title {
-  font-size: 30px;
+  font-size: 38px;
   font-weight: 600;
   margin: 0;
 }
@@ -80,8 +80,8 @@ body {
 
 /* logo images */
 .header-logo-img {
-  height: 75px;               /* Target height: 70-80px (using 75px) */
-  max-height: 80px;           /* Maximum height cap */
+  height: 95px;               /* Larger logo (e.g. Oregon.jpg) */
+  max-height: 100px;          /* Maximum height cap */
   width: auto;                /* Maintain aspect ratio */
   max-width: 100%;            /* Responsive: don't overflow container */
   object-fit: contain;        /* Preserve aspect ratio */
@@ -91,24 +91,24 @@ body {
 /* Responsive logo sizing for smaller screens */
 @media (max-width: 768px) {
   .app-header {
-    height: 90px;             /* Slightly smaller header on tablets */
-    min-height: 90px;
+    height: 100px;             /* Slightly smaller header on tablets */
+    min-height: 100px;
     padding: 0 16px;          /* Reduce padding */
   }
   
   .app-header-side {
-    width: 140px;             /* Narrower logo areas on smaller screens */
-    min-width: 100px;
+    width: 160px;             /* Narrower logo areas on smaller screens */
+    min-width: 120px;
   }
   
   .header-logo-img {
-    height: 60px;             /* Smaller logos on tablets */
-    max-height: 65px;
+    height: 70px;             /* Smaller logos on tablets */
+    max-height: 75px;
   }
   
   .app-main {
-    margin-top: 90px;
-    height: calc(100vh - 90px);
+    margin-top: 100px;
+    height: calc(100vh - 100px);
   }
 }
 
@@ -135,7 +135,7 @@ body {
   }
   
   .app-title {
-    font-size: 20px;          /* Slightly smaller title on mobile */
+    font-size: 22px;          /* Slightly smaller title on mobile */
   }
 }
 
@@ -149,7 +149,7 @@ body {
 }
 
 .app-main {
-  margin-top: 100px; /* same as header height */
+  margin-top: 120px; /* same as header height */
   height: calc(100vh - 100px);
   min-height: 0;
   overflow: hidden; /* No page scroll; map always visible; sidebars scroll internally */
@@ -349,12 +349,27 @@ body {
   z-index: 900;
   align-self: stretch; /* Stretch to fill grid row height */
   min-height: 0; /* Allow shrinking */
-  overflow-y: auto; /* Scroll only if content exceeds height */
+  overflow: hidden; /* Flex children (e.g. Created Rasters list) scroll internally */
+  display: flex;
+  flex-direction: column;
 }
 
-/* Content inside panel - no scrolling, expands naturally */
+/* Content inside panel - flex column so tab content can fill height */
 .sliding-panel-inner {
   padding: 18px;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Tab content fills remaining height and is a flex column (enables Created Rasters to grow) */
+.tab-content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 /* Toggle button stays outside, vertically centered */
@@ -419,6 +434,20 @@ body {
 /* -------------------------------------------------------
    HISTOGRAM STYLING
 ------------------------------------------------------- */
+
+/* Created Rasters section: grows to fill remaining sidebar height below histogram */
+.created-rasters-section {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.created-rasters-list-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
 
 .histogram-wrapper {
   margin-top: 6px;
@@ -965,6 +994,82 @@ body {
   font-size: 13px;
   color: #475569;
   font-weight: 500;
+}
+
+/* Filter label with info icon + tooltip/popover */
+.filter-label-with-info {
+  position: relative;
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+}
+
+.filter-label-with-info__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  font-size: 13px;
+  color: #475569;
+  font-weight: 500;
+}
+
+.filter-label-with-info__spacer {
+  flex-shrink: 0;
+}
+
+.filter-label-with-info__trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: #e2e8f0;
+  color: #475569;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.filter-label-with-info__trigger:hover,
+.filter-label-with-info__trigger:focus {
+  background: #cbd5e1;
+  color: #1e293b;
+  outline: 2px solid #64748b;
+  outline-offset: 2px;
+}
+
+.filter-label-with-info__short {
+  width: 100%;
+  margin: 2px 0 0 0;
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.4;
+}
+
+.filter-label-with-info__popover {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 6px;
+  max-width: 280px;
+  min-width: 200px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #1e293b;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  z-index: 10000;
+  word-wrap: break-word;
 }
 
 /* Section blocks like "Export", "Custom AOI" */

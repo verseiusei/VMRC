@@ -520,6 +520,42 @@ export default function LayerGroupManager({
   }
 
   /**
+   * Remove ALL raster overlays from the map and overlay registries only.
+   * Does NOT remove AOI layers or call onClearAll. Used when switching to a new AOI (draw/upload).
+   */
+  function removeAllRasterOverlaysOnly() {
+    if (!map || !overlayLayerGroupRef.current) {
+      console.warn("[LayerGroupManager] removeAllRasterOverlaysOnly: Map or overlay group not available");
+      return;
+    }
+    const overlayCount = overlayByRasterId.current.size;
+    const rasterIds = Array.from(overlayByRasterId.current.keys());
+    console.log(`[LayerGroupManager] removeAllRasterOverlaysOnly: Removing ${overlayCount} overlay(s) from map (AOI layers kept)`);
+    for (const rasterId of rasterIds) {
+      const overlay = overlayByRasterId.current.get(rasterId);
+      if (overlay) {
+        try {
+          if (overlayLayerGroupRef.current.hasLayer(overlay)) {
+            overlayLayerGroupRef.current.removeLayer(overlay);
+          }
+          if (map.hasLayer && map.hasLayer(overlay)) {
+            map.removeLayer(overlay);
+          }
+        } catch (err) {
+          console.warn(`[LayerGroupManager] Error removing overlay ${rasterId}:`, err);
+        }
+      }
+    }
+    overlayByRasterId.current.clear();
+    rasterOverlaysByRasterId.current.clear();
+    rasterIdsByAoiId.current.clear();
+    activeRasterByAoiId.current.clear();
+    pairByAoiId.current.clear();
+    pairsRef.current.clear();
+    console.log(`[LayerGroupManager] removeAllRasterOverlaysOnly: ✅ Done (${overlayCount} overlay(s) removed)`);
+  }
+
+  /**
    * Clear all AOIs and overlays from the map and registries
    * This is called when "Clear All" button is clicked
    */
@@ -1963,6 +1999,7 @@ export default function LayerGroupManager({
         hideRasterOverlay,
         removeRasterOverlay,
         removeAllRastersForAoi,
+        removeAllRasterOverlaysOnly,
         setActiveRasterForAoi,
         removeAoiAndAllRasters,
         clearAll,

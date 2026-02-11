@@ -18,7 +18,7 @@ export default function App() {
 
         {/* CENTER TITLE + SUBTITLE */}
         <div className="app-header-center">
-          <h1 className="app-title">VMRC Mortality Calculation</h1>
+          <h1 className="app-title">VMRC Seedling Mortality Simulator</h1>
         </div>
 
         {/* RIGHT LOGO SLOT */}

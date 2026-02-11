@@ -7,12 +7,24 @@ import HistogramPanel from "../components/charts/HistogramPanel";
 import StatsTable from "../components/charts/StatsTable";
 import CreatedRastersList from "../components/raster/CreatedRastersList";
 import LayerInfoPanel from "../components/ui/LayerInfoPanel";
+import FilterLabelWithInfo from "../components/ui/FilterLabelWithInfo";
 
 import { fetchGlobalAOI, clipRaster, exportRaster, downloadBlob, downloadGeoPDF, listDatasets, downloadDataset, getDatasetPreview, deleteGeoPDF, fetchLayerMetadata, fetchRasterMetadata, deleteOverlay, apiUrl, API_BASE } from "../lib/rasterApi";
 import { parseAOIFile, getGeoJSONBounds, normalizeGeoJSON } from "../lib/aoiParser";
 import shp from "shpjs";
 import * as turf from "@turf/turf";
 import { FaChartBar, FaTable } from "react-icons/fa";
+
+// Single source of truth: Time of the Year -> product (HSL | MORTALITY) + month (04-09 | null)
+const TIME_OF_YEAR_MAP = {
+  HSL: { product: "HSL", month: null },
+  APR: { product: "MORTALITY", month: "04" },
+  MAY: { product: "MORTALITY", month: "05" },
+  JUN: { product: "MORTALITY", month: "06" },
+  JUL: { product: "MORTALITY", month: "07" },
+  AUG: { product: "MORTALITY", month: "08" },
+  SEP: { product: "MORTALITY", month: "09" },
+};
 
 export default function MapExplorer() {
   // ======================================================
@@ -111,14 +123,18 @@ export default function MapExplorer() {
   const [selectedRasterPath, setSelectedRasterPath] = useState(null); // Full absolute path
   const [selectedRasterDetails, setSelectedRasterDetails] = useState(null); // Full details for debugging
 
-  // Map Type selector: "mortality" or "hsl"
-  const [mapType, setMapType] = useState("hsl");
+  // Time of the Year: "HSL" | "APR" | "MAY" | "JUN" | "JUL" | "AUG" | "SEP" (single dropdown)
+  const [timeOfYear, setTimeOfYear] = useState("HSL");
 
-  // Species selector (comes after Map Type)
+  // Species selector
   const [species, setSpecies] = useState("Douglas-fir");
 
-  // Mortality filters
-  const [month, setMonth] = useState("04");
+  // Derived from timeOfYear (used everywhere mapType/month were used)
+  const timeOfYearConfig = TIME_OF_YEAR_MAP[timeOfYear] ?? TIME_OF_YEAR_MAP.HSL;
+  const mapType = (timeOfYearConfig.product || "HSL").toLowerCase(); // "hsl" | "mortality"
+  const month = timeOfYearConfig.month; // "04"-"09" | null (null for HSL)
+
+  // Mortality/condition filters
   const [condition, setCondition] = useState("Dry");
 
   // DF-only filters for Mortality
@@ -277,21 +293,24 @@ export default function MapExplorer() {
   }, [activeCreatedRasterId, createdRasters]);
 
   // ======================================================
-  // EFFECT: Sync histogram/Stats selection when selected raster is removed
+  // EFFECT: Sync selection when selected raster is removed (e.g. user deletes it)
   // ======================================================
-  // If activeCreatedRasterId is missing from createdRasters (e.g. raster removed),
-  // fall back to first available raster so dropdown and panel stay valid.
+  // Only run fallback when activeCreatedRasterId was set but is no longer in the list.
+  // Do NOT set a default when activeCreatedRasterId is null (e.g. after filter change);
+  // the generate handler will set the newest raster after successful generate.
+  // Fallback to NEWEST (last) raster, not first, to avoid flashback to overlay #1.
   // ======================================================
   useEffect(() => {
     if (createdRasters.length === 0) return;
+    if (activeCreatedRasterId == null) return; // Leave null; generate will set newest after success
     const found = createdRasters.find((r) => r.id === activeCreatedRasterId);
     if (found) return;
-    const first = createdRasters[0];
-    setActiveCreatedRasterId(first.id);
-    setActiveRasterId(first.activeRasterId);
-    setStats(first.stats || null);
-    setPixelValues(first.pixelValues || []);
-    setHistogram(first.histogram || null);
+    const newest = createdRasters[createdRasters.length - 1];
+    setActiveCreatedRasterId(newest.id);
+    setActiveRasterId(newest.activeRasterId);
+    setStats(newest.stats || null);
+    setPixelValues(newest.pixelValues || []);
+    setHistogram(newest.histogram || null);
   }, [createdRasters, activeCreatedRasterId]);
 
   // ======================================================
@@ -303,7 +322,7 @@ export default function MapExplorer() {
     setSelectedRasterName(null);
     setSelectedRasterPath(null);
     setSelectedRasterDetails(null);
-  }, [mapType, species]);
+  }, [timeOfYear, species]);
 
   // ======================================================
   // EFFECT: Clear overlays/stats when filters change (but keep AOIs)
@@ -372,7 +391,15 @@ export default function MapExplorer() {
       aois: aois.length,
       activeAoi: activeAoi.geoJSON ? true : false,
     });
-  }, [mapType, species, month, condition, dfStress, coverPercent, hslCondition, hslClass]);
+  }, [timeOfYear, species, condition, dfStress, coverPercent, hslCondition, hslClass]);
+
+  // When Species = Western Hemlock, force stress/category to "Medium" for consistent UI (backend ignores for WH)
+  useEffect(() => {
+    if (species === "Western Hemlock") {
+      setDfStress("Medium Stress");
+      setHslClass("m");
+    }
+  }, [species]);
 
   // ======================================================
   // INSTRUMENTATION: Track AOI state changes
@@ -587,6 +614,42 @@ export default function MapExplorer() {
   }
 
   // ======================================================
+  // RESET FOR NEW AOI (draw or upload)
+  // ======================================================
+  // Clears Created rasters list, all raster overlays from map, and raster-related state.
+  // Call when a new AOI is created (draw finished, upload success) so only rasters
+  // from the current AOI appear in the list. Does NOT remove AOI layers.
+  // ======================================================
+  const resetForNewAOI = useCallback(() => {
+    if (isExportingRef.current) {
+      console.warn("[MapExplorer] ⚠️ BLOCKED: resetForNewAOI during export");
+      return;
+    }
+    console.log("[MapExplorer] resetForNewAOI: Clearing created rasters and overlays for new AOI");
+    if (mapInstanceRef.current?._layerGroupManager?.removeAllRasterOverlaysOnly) {
+      mapInstanceRef.current._layerGroupManager.removeAllRasterOverlaysOnly();
+    }
+    setCreatedRasters([]);
+    setActiveCreatedRasterId(null);
+    setActiveRasterId(null);
+    setStats(null);
+    setPixelValues([]);
+    setHistogram(null);
+    setOverlayUrl(null);
+    setOverlayBounds(null);
+    setSelectedRasterLabel(null);
+    setSelectedRasterName(null);
+    setSelectedRasterPath(null);
+    setSelectedRasterDetails(null);
+    try {
+      sessionStorage.removeItem("vmrc_created_rasters");
+      sessionStorage.removeItem("vmrc_active_created_raster_id");
+    } catch (err) {
+      console.error("[MapExplorer] Failed to clear sessionStorage:", err);
+    }
+  }, []);
+
+  // ======================================================
   // HANDLE USER CLIP CHANGE (Drawn AOI)
   // ======================================================
   // Called when user finishes drawing a new AOI
@@ -660,6 +723,9 @@ export default function MapExplorer() {
       return;
     }
 
+    // New AOI created: clear previous AOI's rasters and overlays so list and map match current AOI only
+    resetForNewAOI();
+
     // Create drawn AOI entry (will use stable aoiId from GeoJSON properties below)
     const drawnAoi = {
       id: null, // Will be set to stable aoiId below
@@ -732,7 +798,7 @@ export default function MapExplorer() {
       name: "Drawn AOI",
     });
     console.log("[MapExplorer] Set active AOI to drawn AOI:", stableAoiId);
-  }, [selectedAois]);
+  }, [selectedAois, resetForNewAOI]);
 
   // ======================================================
   // LABEL BUILDING HELPERS
@@ -775,7 +841,7 @@ export default function MapExplorer() {
     return "l"; // Default
   }
 
-  // Build raster label from current filters
+  // Build raster label from current filters (month may be null for HSL)
   function buildRasterLabel(mapType, species, month, condition, dfStress, coverPercent, hslCondition, hslClass) {
     const parts = [];
 
@@ -784,7 +850,7 @@ export default function MapExplorer() {
 
     parts.push(species);
 
-    if (mapType === "mortality") {
+    if (mapType === "mortality" && month) {
       parts.push(condition);
       parts.push(getMonthName(month));
     } else if (mapType === "hsl") {
@@ -868,11 +934,11 @@ export default function MapExplorer() {
       else climateCode = "DRY";
     }
 
-    // Month (use as-is: 04-09)
-    const monthCode = month || "04";
+    // Month: only for Mortality; HSL must exclude month
+    const monthPart = mapType === "hsl" ? "" : `_${month || "04"}`;
 
     // Build filename (without extension - backend adds it)
-    const filename = `${mapTypePrefix}_${speciesCode}_${cover}_${climateCode}_${monthCode}${fileExtension ? `.${fileExtension}` : ""}`;
+    const filename = `${mapTypePrefix}_${speciesCode}_${cover}_${climateCode}${monthPart}${fileExtension ? `.${fileExtension}` : ""}`;
     return filename;
   }
 
@@ -980,7 +1046,7 @@ export default function MapExplorer() {
 
     if (species === "Western Hemlock") {
       if (!coverPercent || coverPercent.trim() === "") {
-        alert("Please select a Cover % value for Western Hemlock mortality rasters.");
+        alert("Please select a Cover (%) value for Western Hemlock mortality rasters.");
         return null;
       }
 
@@ -1044,7 +1110,7 @@ export default function MapExplorer() {
       return null;
     } else {
       if (!coverPercent || coverPercent.trim() === "") {
-        alert("Please select a Cover % value for Douglas-fir mortality rasters.");
+        alert("Please select a Cover (%) value for Douglas-fir mortality rasters.");
         return null;
       }
 
@@ -1148,7 +1214,7 @@ export default function MapExplorer() {
     let expectedName = "";
     if (isWh) {
       if (!cover || cover.trim() === "") {
-        alert("Please select a Cover % value for Western Hemlock HSL rasters.");
+        alert("Please select a Cover (%) value for Western Hemlock HSL rasters.");
         return null;
       }
 
@@ -1277,10 +1343,22 @@ export default function MapExplorer() {
   // ======================================================
   // Helper: Deep compare filters to detect if they're the same
   // ======================================================
+  // Normalize filters to canonical form (timeOfYear) for comparison; supports legacy mapType+month
+  const normalizeFiltersForCompare = useCallback((f) => {
+    if (!f) return null;
+    if (f.timeOfYear) return { ...f, timeOfYear: f.timeOfYear };
+    const mapType = f.mapType || "";
+    const month = f.month;
+    const timeOfYear = mapType === "hsl" ? "HSL" : month === "04" ? "APR" : month === "05" ? "MAY" : month === "06" ? "JUN" : month === "07" ? "JUL" : month === "08" ? "AUG" : month === "09" ? "SEP" : "APR";
+    return { ...f, timeOfYear };
+  }, []);
   const sameFilters = useCallback((filtersA, filtersB) => {
     if (!filtersA || !filtersB) return false;
-    return JSON.stringify(filtersA) === JSON.stringify(filtersB);
-  }, []);
+    const a = normalizeFiltersForCompare(filtersA);
+    const b = normalizeFiltersForCompare(filtersB);
+    if (!a || !b) return false;
+    return a.timeOfYear === b.timeOfYear && a.species === b.species && a.condition === b.condition && a.dfStress === b.dfStress && a.coverPercent === b.coverPercent && a.hslCondition === b.hslCondition && a.hslClass === b.hslClass;
+  }, [normalizeFiltersForCompare]);
 
   // ======================================================
   // Add function: Append a raster instance (do NOT replace existing for same AOI)
@@ -1519,11 +1597,12 @@ export default function MapExplorer() {
     const successfulRasters = [];
     const failedAois = [];
 
-    // Current filters object for comparison
+    // Current filters object for comparison (timeOfYear is source of truth; mapType+month derived)
     const currentFilters = {
+      timeOfYear,
       mapType,
-      species,
       month,
+      species,
       condition,
       dfStress,
       coverPercent,
@@ -1676,9 +1755,10 @@ export default function MapExplorer() {
         aoiGeojson: aoi.geojson, // Store AOI GeoJSON for export
         isVisible: true,
         filtersUsed: {
+          timeOfYear,
           mapType,
-          species,
           month,
+          species,
           condition,
           dfStress,
           coverPercent,
@@ -1686,9 +1766,10 @@ export default function MapExplorer() {
           hslClass,
         },
         meta: {
+          timeOfYear,
           mapType,
-          species,
           month,
+          species,
           condition,
           dfStress,
           coverPercent,
@@ -1742,19 +1823,14 @@ export default function MapExplorer() {
       hasUploads: aois.some(a => a.type === "upload")
     });
 
-    // Rasters have already been upserted into state during the loop
-    // Now set the most recently generated raster as active (for histogram display and click sampling)
+    // After successful generate, auto-select the newest raster for that AOI (no flashback to #1).
     if (successfulRasters.length > 0) {
-      // Use the last successful raster (most recently generated) as active
       const lastRaster = successfulRasters[successfulRasters.length - 1];
-      setActiveRasterId(rasterLayerId); // Backend raster layer ID (for click sampling)
-      setActiveCreatedRasterId(lastRaster.id); // Created raster ID (for histogram)
-      
-      // IMPORTANT: Set stats and histogram for the active raster
+      setActiveRasterId(rasterLayerId);
+      setActiveCreatedRasterId(lastRaster.id);
       setStats(lastRaster.stats || null);
       setPixelValues(lastRaster.pixelValues || []);
       setHistogram(lastRaster.histogram || null);
-      
       console.log("[MapExplorer] Set active raster:", lastRaster.id, "with stats:", lastRaster.stats ? "✓" : "✗");
     }
 
@@ -2051,6 +2127,11 @@ export default function MapExplorer() {
       }
 
       // ============================================================
+      // New AOI(s) added via upload: clear previous rasters and overlays so list matches current AOI only
+      // ============================================================
+      resetForNewAOI();
+
+      // ============================================================
       // Multiple AOIs allowed: append new AOI(s) (overlap already rejected above)
       // ============================================================
       setAois((prev) => [...prev, ...newAois]);
@@ -2197,27 +2278,13 @@ export default function MapExplorer() {
     }
   }
 
-  // Clear all AOIs (both drawn and uploaded, but NOT AOI_diss)
-  function handleClearUploadedAois() {
+  // Clear all AOIs and all created rasters (removes everything from map and state)
+  async function handleClearUploadedAois() {
     console.log("[MapExplorer] 🗑️ EXPLICIT CLEAR ALL: handleClearUploadedAois");
     console.trace("[AOI_CLEAR] handleClearUploadedAois - explicit user action");
-    
-    // Clear uploaded AOIs and drawn AOIs, but NOT globalAoi (AOI_diss)
-    setAois([]);
-    setUploadedAois([]);
-    setSelectedAois([]);
-    setUserClip(null);
 
-    // CRITICAL: Also clear persistent refs (this is an explicit user action)
-    persistentDrawnAoiRef.current = null;
-    persistentDrawnAoiIdRef.current = null;
-    persistentAoisRef.current = [];
-    userClipRef.current = null;
-    drawnAoiIdRef.current = null;
-
-    // Clear overlays when clearing AOIs
-    // CRITICAL: Pass explicit reason - this is an explicit user action (clear all)
-    handleStartNewAoi("clear-all");
+    // Clear all rasters + overlays from map and reset full state (AOIs, created rasters, etc.)
+    await handleClearAllRasters();
 
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
@@ -2715,9 +2782,10 @@ export default function MapExplorer() {
         exportBaseName = getExportBaseFromRasterName(selectedRasterPath);
         console.log(`[Export] Using selectedRasterPath: ${selectedRasterPath} -> ${exportBaseName}`);
       } else {
-        // Last resort: build from filters if raster name not available
+        // Last resort: build from selected raster's filters (not current UI state)
+        const f = raster.filtersUsed || raster.meta || {};
         console.warn("[Export] selectedRasterName not available (Raster Overview), falling back to filter-based filename");
-        exportBaseName = buildExportName(mapType, species, month, condition, coverPercent, hslCondition, "").replace(/\.\w+$/, "");
+        exportBaseName = buildExportName(f.mapType ?? mapType, f.species ?? species, f.month ?? month, f.condition ?? condition, f.coverPercent ?? coverPercent, f.hslCondition ?? hslCondition, "").replace(/\.\w+$/, "");
       }
       
       // Use user-provided filename if set, otherwise use raster base name
@@ -2771,13 +2839,16 @@ export default function MapExplorer() {
       // Backend returns {status: "success", files: {png: "...", tif: "...", ...}}
       // Frontend expects flat structure {png: "...", tif: "...", ...}
       const exportFiles = data.files || data;
+      const exportErrors = data.errors || {};
       console.log("[Export] Export files:", exportFiles);
+      if (Object.keys(exportErrors).length > 0) console.log("[Export] Export errors:", exportErrors);
       
-      // Store export context and raster name with results for filename generation on download
+      // Store export context, errors, and raster name with results for filename generation on download
       const exportResultsWithContext = {
         ...exportFiles,
-        _exportContext: exportContext, // Store context for filename generation
-        _rasterBaseName: exportBaseName, // Store raster base name for download filenames
+        _exportContext: exportContext,
+        _rasterBaseName: exportBaseName,
+        _errors: exportErrors,
       };
       
       setExportResults(exportResultsWithContext);
@@ -2805,6 +2876,45 @@ export default function MapExplorer() {
   // Check if HSL + WH combination is invalid (WH HSL rasters don't exist)
   const isHslWhInvalid = mapType === "hsl" && species === "Western Hemlock" && !hasWhHslRasters;
 
+  // Single helper for stress/category dropdown: label, value, options, disabled (WH = Medium only, UI-only)
+  const getStressControlConfig = (mode) => {
+    const isHSL = mode === "hsl";
+    const isWH = species === "Western Hemlock";
+    if (isHSL) {
+      return {
+        label: "Seedling Drought Resistance Category",
+        value: isWH ? "m" : hslClass,
+        options: isWH
+          ? [{ value: "m", label: "Medium (PLC 2.5 = # Mpa)" }]
+          : [
+              { value: "l", label: "Low (PLC 2.5 = # Mpa)" },
+              { value: "ml", label: "Medium-Low (PLC 2.5 = # Mpa)" },
+              { value: "m", label: "Medium (PLC 2.5 = # Mpa)" },
+              { value: "mh", label: "Medium-High (PLC 2.5 = # Mpa)" },
+              { value: "h", label: "High (PLC 2.5 = # Mpa)" },
+              { value: "vh", label: "Very High (PLC 2.5 = # Mpa)" },
+            ],
+        disabled: isWH,
+        onChange: (e) => setHslClass(e.target.value),
+      };
+    }
+    return {
+      label: "Seedling Drought Resistance Category",
+      value: isWH ? "Medium Stress" : dfStress,
+      options: isWH
+        ? [{ value: "Medium Stress", label: "Medium (PLC 2.5 = # Mpa)" }]
+        : [
+            { value: "Low Stress", label: "Low (PLC 2.5 = # Mpa)" },
+            { value: "Medium-Low Stress", label: "Medium-Low (PLC 2.5 = # Mpa)" },
+            { value: "Medium Stress", label: "Medium (PLC 2.5 = # Mpa)" },
+            { value: "Medium-High Stress", label: "Medium-High (PLC 2.5 = # Mpa)" },
+            { value: "High Stress", label: "High (PLC 2.5 = # Mpa)" },
+          ],
+      disabled: isWH,
+      onChange: (e) => setDfStress(e.target.value),
+    };
+  };
+
   // ======================================================
   // RENDER
   // ======================================================
@@ -2814,21 +2924,26 @@ export default function MapExplorer() {
       <aside className="panel-left card">
         <h2 className="panel-title">Filters</h2>
 
-        {/* MAP TYPE SELECTOR */}
+        {/* TIME OF THE YEAR (single dropdown: HSL or April–September) */}
         <div className="filter-block">
-          <label>Map Type</label>
-          <select value={mapType} onChange={(e) => setMapType(e.target.value)} className="input">
-            <option value="mortality">Mortality (Monthly)</option>
-            <option value="hsl">High Stress Level (HSL)</option>
+          <FilterLabelWithInfo id="timeOfYear" />
+          <select value={timeOfYear} onChange={(e) => setTimeOfYear(e.target.value)} className="input">
+            <option value="HSL">High Stress Level</option>
+            <option value="APR">April</option>
+            <option value="MAY">May</option>
+            <option value="JUN">June</option>
+            <option value="JUL">July</option>
+            <option value="AUG">August</option>
+            <option value="SEP">September</option>
           </select>
         </div>
 
         {/* SPECIES SELECTOR */}
         <div className="filter-block">
-          <label>Species</label>
+          <FilterLabelWithInfo id="species" />
           <select value={species} onChange={(e) => setSpecies(e.target.value)} className="input">
             <option value="Douglas-fir">Douglas-fir</option>
-            <option value="Western Hemlock">Western Hemlock</option>
+            <option value="Western Hemlock">Western hemlock</option>
           </select>
         </div>
 
@@ -2850,32 +2965,20 @@ export default function MapExplorer() {
           </div>
         )}
 
-        {/* HSL FILTERS (DF) */}
+        {/* HSL FILTERS (DF) - Climate + Cover; stress category row is below for both species */}
         {mapType === "hsl" && species === "Douglas-fir" && (
           <>
             <div className="filter-block">
-              <label>HSL Condition</label>
+              <FilterLabelWithInfo id="climateScenario" />
               <select value={hslCondition} onChange={(e) => setHslCondition(e.target.value)} className="input">
-                <option value="D">D (Dry)</option>
-                <option value="W">W (Wet)</option>
-                <option value="N">N (Normal)</option>
+                <option value="N">Normal</option>
+                <option value="D">Dry</option>
+                <option value="W">Wet</option>
               </select>
             </div>
 
             <div className="filter-block">
-              <label>HSL Class</label>
-              <select value={hslClass} onChange={(e) => setHslClass(e.target.value)} className="input">
-                <option value="l">l (Low)</option>
-                <option value="ml">ml (Medium-Low)</option>
-                <option value="m">m (Medium)</option>
-                <option value="mh">mh (Medium-High)</option>
-                <option value="h">h (High)</option>
-                <option value="vh">vh (Very High)</option>
-              </select>
-            </div>
-
-            <div className="filter-block">
-              <label>Cover %</label>
+              <FilterLabelWithInfo id="coverPercent" />
               <select value={coverPercent} onChange={(e) => setCoverPercent(e.target.value)} className="input">
                 <option value="0">0%</option>
                 <option value="25">25%</option>
@@ -2887,20 +2990,20 @@ export default function MapExplorer() {
           </>
         )}
 
-        {/* HSL FILTERS (WH - condition + cover) */}
+        {/* HSL FILTERS (WH - condition + cover); stress category row is below for both species */}
         {mapType === "hsl" && species === "Western Hemlock" && hasWhHslRasters && (
           <>
             <div className="filter-block">
-              <label>HSL Condition</label>
+              <FilterLabelWithInfo id="hslCondition" />
               <select value={hslCondition} onChange={(e) => setHslCondition(e.target.value)} className="input">
-                <option value="D">D (Dry)</option>
-                <option value="W">W (Wet)</option>
-                <option value="N">N (Normal)</option>
+                <option value="N">Normal</option>
+                <option value="D">Dry</option>
+                <option value="W">Wet</option>
               </select>
             </div>
 
             <div className="filter-block">
-              <label>Cover %</label>
+              <FilterLabelWithInfo id="coverPercent" />
               <select value={coverPercent} onChange={(e) => setCoverPercent(e.target.value)} className="input">
                 <option value="0">0%</option>
                 <option value="25">25%</option>
@@ -2912,59 +3015,41 @@ export default function MapExplorer() {
           </>
         )}
 
-        {/* MORTALITY FILTERS */}
+        {/* HSL: Stress / Seedling Drought Resistance Category — always shown for both species (WH = Medium only, disabled) */}
+        {mapType === "hsl" && (() => {
+          const c = getStressControlConfig("hsl");
+          return (
+            <div className="filter-block" key="hsl-stress">
+              <FilterLabelWithInfo id="seedlingDroughtCategory" label={c.label} />
+              <select
+                value={c.value}
+                onChange={(e) => !c.disabled && c.onChange(e)}
+                className="input"
+                disabled={c.disabled}
+              >
+                {c.options.map((opt) => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+            </div>
+          );
+        })()}
+
+        {/* MORTALITY FILTERS (month is fixed by Time of the Year selection; no separate Month dropdown) */}
         {mapType === "mortality" && (
           <>
             <div className="filter-block">
-              <label>Month</label>
-              <select value={month} onChange={(e) => setMonth(e.target.value)} className="input">
-                <option value="04">April</option>
-                <option value="05">May</option>
-                <option value="06">June</option>
-                <option value="07">July</option>
-                <option value="08">August</option>
-                <option value="09">September</option>
-              </select>
-            </div>
-
-            <div className="filter-block">
-              <label>Condition</label>
+              <FilterLabelWithInfo id="condition" />
               <select value={condition} onChange={(e) => setCondition(e.target.value)} className="input">
+                <option value="Normal">Normal</option>
                 <option value="Dry">Dry</option>
                 <option value="Wet">Wet</option>
-                <option value="Normal">Normal</option>
               </select>
             </div>
 
             {species === "Douglas-fir" && (
-              <>
-                <div className="filter-block">
-                  <label>Cover %</label>
-                  <select value={coverPercent} onChange={(e) => setCoverPercent(e.target.value)} className="input">
-                    <option value="0">0%</option>
-                    <option value="25">25%</option>
-                    <option value="50">50%</option>
-                    <option value="75">75%</option>
-                    <option value="100">100%</option>
-                  </select>
-                </div>
-
-                <div className="filter-block">
-                  <label>Stress Level</label>
-                  <select value={dfStress} onChange={(e) => setDfStress(e.target.value)} className="input">
-                    <option value="Low Stress">Low Stress</option>
-                    <option value="Medium-Low Stress">Medium-Low Stress</option>
-                    <option value="Medium Stress">Medium Stress</option>
-                    <option value="Medium-High Stress">Medium-High Stress</option>
-                    <option value="High Stress">High Stress</option>
-                  </select>
-                </div>
-              </>
-            )}
-
-            {species === "Western Hemlock" && (
               <div className="filter-block">
-                <label>Cover %</label>
+                <FilterLabelWithInfo id="coverPercent" />
                 <select value={coverPercent} onChange={(e) => setCoverPercent(e.target.value)} className="input">
                   <option value="0">0%</option>
                   <option value="25">25%</option>
@@ -2974,6 +3059,39 @@ export default function MapExplorer() {
                 </select>
               </div>
             )}
+
+            {species === "Western Hemlock" && (
+              <div className="filter-block">
+                <FilterLabelWithInfo id="coverPercent" />
+                <select value={coverPercent} onChange={(e) => setCoverPercent(e.target.value)} className="input">
+                  <option value="0">0%</option>
+                  <option value="25">25%</option>
+                  <option value="50">50%</option>
+                  <option value="75">75%</option>
+                  <option value="100">100%</option>
+                </select>
+              </div>
+            )}
+
+            {/* Stress Level: always shown for Mortality; DF = full options, WH = "Medium" only (UI-only, backend unchanged) */}
+            {(() => {
+              const c = getStressControlConfig("mortality");
+              return (
+                <div className="filter-block" key="mortality-stress">
+                  <FilterLabelWithInfo id="stressLevel" label={c.label} />
+                  <select
+                    value={c.value}
+                    onChange={(e) => !c.disabled && c.onChange(e)}
+                    className="input"
+                    disabled={c.disabled}
+                  >
+                    {c.options.map((opt) => (
+                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                    ))}
+                  </select>
+                </div>
+              );
+            })()}
           </>
         )}
 
@@ -3065,7 +3183,7 @@ export default function MapExplorer() {
                   onMouseDown={(e) => e.stopPropagation()}
                   onClick={(e) => e.stopPropagation()}
                 >
-                <label className="sidebar-label">Filename (optional)</label>
+                <FilterLabelWithInfo id="exportFilename" />
                 <input
                   type="text"
                   className="input"
@@ -3084,7 +3202,9 @@ export default function MapExplorer() {
                   onMouseDown={(e) => e.stopPropagation()}
                   onClick={(e) => e.stopPropagation()}
                 >
-                <label style={{ display: "block", marginBottom: "8px", fontSize: "13px", fontWeight: 500, color: "#374151" }}>Export Formats:</label>
+                <div style={{ marginBottom: "8px" }}>
+                  <FilterLabelWithInfo id="exportFormats" label="Export Formats" />
+                </div>
                 <label className="checkbox-row">
                   <input
                     type="checkbox"
@@ -3168,6 +3288,14 @@ export default function MapExplorer() {
                   >
                     Export Results
                   </h4>
+
+                  {exportResults._errors && Object.keys(exportResults._errors).length > 0 && (
+                    <div style={{ marginBottom: 8, fontSize: 12, color: "#b91c1c" }}>
+                      {Object.entries(exportResults._errors).map(([fmt, msg]) => (
+                        <div key={fmt}>{(fmt || "export").toUpperCase()}: {String(msg)}</div>
+                      ))}
+                    </div>
+                  )}
 
                   <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
                     {exportResults.png && (
@@ -3536,7 +3664,7 @@ export default function MapExplorer() {
           )}
 
           {activeTab === "table" && (
-            <>
+            <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
               {/* Dropdown to select which AOI's stats to display */}
               {createdRasters.length > 0 && (
                 <div style={{ marginBottom: "16px" }}>
@@ -3611,63 +3739,67 @@ export default function MapExplorer() {
                   Draw or upload an AOI to begin.
                 </div>
               )}
-            </>
+            </div>
           )}
           {activeTab === "histogram" && (
             <>
               {/* Histogram for: dropdown — same list as Stats / Created Rasters */}
               {createdRasters.length > 0 ? (
-                <>
-                  <div style={{ marginBottom: "16px" }}>
-                    <label style={{ display: "block", marginBottom: "6px", fontSize: "13px", fontWeight: 500, color: "#374151" }}>
-                      Histogram for:
-                    </label>
-                    <select
-                      value={activeCreatedRasterId || ""}
-                      onChange={(e) => {
-                        const selectedId = e.target.value;
-                        if (selectedId) handleShowRaster(selectedId);
-                      }}
-                      style={{
-                        width: "100%",
-                        padding: "8px 12px",
-                        fontSize: "13px",
-                        border: "1px solid #d1d5db",
-                        borderRadius: "4px",
-                        backgroundColor: "#ffffff",
-                        color: "#111827",
-                      }}
-                    >
-                      <option value="">Select a raster…</option>
-                      {createdRasters.map((raster) => (
-                        <option key={raster.id} value={raster.id}>
-                          {raster.name || raster.aoiName || `Raster ${raster.id}`}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  {/* Show histogram for selected raster */}
-                  {activeCreatedRasterId && createdRasters.find((r) => r.id === activeCreatedRasterId) ? (
-                    <HistogramPanel
-                      values={pixelValues}
-                      stats={stats}
-                      histogram={histogram}
-                    />
-                  ) : (
-                    <div style={{ padding: "20px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
-                      Select a raster from the dropdown above to view its histogram.
+                <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
+                  <div style={{ flexShrink: 0 }}>
+                    <div style={{ marginBottom: "6px" }}>
+                      <label style={{ display: "block", marginBottom: "4px", fontSize: "13px", fontWeight: 500, color: "#374151" }}>
+                        Histogram for:
+                      </label>
+                      <select
+                        value={activeCreatedRasterId || ""}
+                        onChange={(e) => {
+                          const selectedId = e.target.value;
+                          if (selectedId) handleShowRaster(selectedId);
+                        }}
+                        style={{
+                          width: "100%",
+                          padding: "8px 12px",
+                          fontSize: "13px",
+                          border: "1px solid #d1d5db",
+                          borderRadius: "4px",
+                          backgroundColor: "#ffffff",
+                          color: "#111827",
+                        }}
+                      >
+                        <option value="">Select a raster…</option>
+                        {createdRasters.map((raster) => (
+                          <option key={raster.id} value={raster.id}>
+                            {raster.name || raster.aoiName || `Raster ${raster.id}`}
+                          </option>
+                        ))}
+                      </select>
                     </div>
-                  )}
-                  {/* Created Rasters list — all rasters (Show/Hide/Remove) */}
-                  <CreatedRastersList
-                    rasters={createdRasters}
-                    activeRasterId={activeCreatedRasterId}
-                    onShowRaster={handleShowRaster}
-                    onToggleVisibility={handleToggleRasterVisibility}
-                    onRemoveRaster={handleRemoveRaster}
-                    onClearAll={createdRasters.length > 0 ? handleClearAllRasters : null}
-                  />
-                </>
+                    {/* Show histogram for selected raster */}
+                    {activeCreatedRasterId && createdRasters.find((r) => r.id === activeCreatedRasterId) ? (
+                      <HistogramPanel
+                        values={pixelValues}
+                        stats={stats}
+                        histogram={histogram}
+                      />
+                    ) : (
+                      <div style={{ padding: "20px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
+                        Select a raster from the dropdown above to view its histogram.
+                      </div>
+                    )}
+                  </div>
+                  {/* Created Rasters section — fills remaining height, list scrolls inside */}
+                  <div className="created-rasters-section">
+                    <CreatedRastersList
+                      rasters={createdRasters}
+                      activeRasterId={activeCreatedRasterId}
+                      onShowRaster={handleShowRaster}
+                      onToggleVisibility={handleToggleRasterVisibility}
+                      onRemoveRaster={handleRemoveRaster}
+                      onClearAll={createdRasters.length > 0 ? handleClearAllRasters : null}
+                    />
+                  </div>
+                </div>
               ) : (
                 <div style={{ padding: "20px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
                   Generate a raster to view a histogram.

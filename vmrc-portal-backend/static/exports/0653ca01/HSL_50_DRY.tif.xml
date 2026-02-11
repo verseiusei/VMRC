@@ -1,0 +1,25 @@
+<?xml version='1.0' encoding='utf-8'?>
+<metadata xmlns="http://www.esri.com/metadata/" xmlns:esri="http://www.esri.com/metadata/" xmlns:gml="http://www.opengis.net/gml" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.esri.com/metadata/ http://www.esri.com/metadata/esriprof80.xsd">
+  <dataIdInfo>
+    <idCitation>
+      <resTitle>High Stress Level - Western Hemlock</resTitle>
+    </idCitation>
+    <idAbs>This dataset represents high stress level data for Western Hemlock. Climate condition: Dry. Cover percentage: 50%.</idAbs>
+    <idPurp>VMRC (Vegetation Management Research Cooperative) Seedling Mortality Simulator (SMS) Export Dataset
+
+Species: Western hemlock
+Seedling Drought Resistance Category: Medium (only option for Western hemlock)
+Time of the Year: High Stress Level
+Climate Scenario: Dry
+Maximum Vegetation Cover (%): 50</idPurp>
+    <searchKeys>
+      <keyword>VMRC, HSL, Western_Hemlock, Dry, Cover_50%</keyword>
+    </searchKeys>
+    <idCredit>VMRC Project</idCredit>
+    <resConst>
+      <Consts>
+        <useLimit>For research and visualization purposes only.</useLimit>
+      </Consts>
+    </resConst>
+  </dataIdInfo>
+</metadata>

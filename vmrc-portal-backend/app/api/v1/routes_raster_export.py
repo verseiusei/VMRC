@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 from app.services.raster_service import clip_raster_for_layer, resolve_raster_path
+from app.services.layer_metadata import compute_pixel_size
 from pathlib import Path
 import rasterio
 from rasterio.mask import mask
@@ -39,7 +40,7 @@ try:
     from reportlab.lib.pagesizes import letter, A4, landscape
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak, KeepTogether
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak, KeepTogether, KeepInFrame
     from reportlab.lib import colors
     from reportlab.pdfgen import canvas
     # Note: ImageReader is only for canvas.drawImage(), not for Platypus Image flowable
@@ -117,16 +118,64 @@ def expand_condition(condition: str) -> str:
 
 
 def get_stress_display_name(stress_code: str) -> str:
-    """Convert stress code to display name."""
+    """Convert stress code to display name (no 'Stress' in option text, no acronyms)."""
     stress_map = {
-        "l": "Low Stress",
-        "ml": "Medium-Low Stress",
-        "m": "Medium Stress",
-        "mh": "Medium-High Stress",
-        "h": "High Stress",
-        "vh": "Very High Stress"
+        "l": "Low",
+        "ml": "Medium-low",
+        "m": "Medium",
+        "mh": "Medium-high",
+        "h": "High",
+        "vh": "Very High"
     }
-    return stress_map.get(stress_code.lower(), stress_code)
+    return stress_map.get((stress_code or "").lower(), str(stress_code) if stress_code else "")
+
+
+def format_report_selections(context: Optional[Dict[str, Any]]) -> List[tuple]:
+    """
+    Build Raster/Selection Summary rows for PDF: list of (label, value) in required order.
+    Uses UI filter titles; values are display names (no D/W/N, no acronyms).
+    Western hemlock: drought resistance shows only "Medium (only option for Western hemlock)".
+    """
+    if not context:
+        return []
+    rows = []
+    species_raw = context.get("species", "")
+    species_display = "Douglas-fir" if species_raw == "Douglas-fir" else "Western hemlock" if species_raw == "Western Hemlock" else (species_raw or "—")
+    is_wh = (species_raw or "").lower() in ("western hemlock", "wh")
+
+    # 1) Species
+    rows.append(("Species", species_display))
+
+    # 2) Seedling Drought Resistance Category (WH: only Medium; DF: full name, optionally with PLC when available)
+    hsl_class = context.get("hslClass") or context.get("stressLevel") or ""
+    if is_wh:
+        drought_display = "Medium (only option for Western hemlock)"
+    else:
+        drought_display = get_stress_display_name(hsl_class) if hsl_class else "—"
+        plc_mpa = context.get("plcMpa") or context.get("plc_mpa")
+        if drought_display and plc_mpa is not None:
+            drought_display = f"{drought_display} (PLC 2.5 = {plc_mpa} MPa)"
+    rows.append(("Seedling Drought Resistance Category", drought_display))
+
+    # 3) Time of the Year
+    map_type = (context.get("mapType") or context.get("product") or "").lower()
+    if map_type == "hsl":
+        time_display = "High Stress Level"
+    else:
+        month = context.get("month", "")
+        time_display = get_month_name(month) if month else "—"
+    rows.append(("Time of the Year", time_display))
+
+    # 4) Climate Scenario (Normal, Dry, Wet — no D/W/N)
+    cond = context.get("condition") or context.get("hslCondition") or ""
+    climate_display = expand_condition(cond) if cond else "—"
+    rows.append(("Climate Scenario", climate_display))
+
+    # 5) Maximum Vegetation Cover (%)
+    cover = context.get("coverPercent")
+    rows.append(("Maximum Vegetation Cover (%)", str(cover) if cover is not None and cover != "" else "—"))
+
+    return rows
 
 
 def get_month_name(month_code: str) -> str:
@@ -191,12 +240,14 @@ def build_export_filename(context: Optional[Dict[str, Any]], extension: str = ""
     if not context:
         return generate_default_filename() + extension
     
-    # Extract and normalize values
+    # Extract and normalize values (support both legacy mapType and new product + month)
     map_type = str(context.get("mapType", "")).upper()
+    if not map_type and context.get("product"):
+        map_type = str(context.get("product", "")).upper()
     species = context.get("species", "")
     condition = context.get("condition", "")
     hsl_condition = context.get("hslCondition", "")
-    month = context.get("month")
+    month = context.get("month")  # None or omitted for HSL; "04"-"09" for MORTALITY
     cover_percent = context.get("coverPercent")
     hsl_class = context.get("hslClass")
     
@@ -324,8 +375,8 @@ def build_human_readable_raster_label(context: Optional[Dict[str, Any]]) -> str:
     
     parts = []
     
-    # Map Type
-    map_type = context.get("mapType", "")
+    # Map Type (support both mapType and product)
+    map_type = context.get("mapType", "") or (context.get("product") or "").lower()
     if map_type == "hsl":
         parts.append("High Stress Level")
     elif map_type == "mortality":
@@ -456,6 +507,14 @@ def compute_expanded_stats(stats: Dict[str, Any], histogram: Optional[Dict[str, 
             "count": int(dominant_count),
             "percent": float(dominant_percent),
         }
+        # Area by Mortality Class (5 bins: 0-20, 20-40, 40-60, 60-80, 80-100) for one-page PDF
+        # Bins 0-1 -> 0-20, 2-3 -> 20-40, 4-5 -> 40-60, 6-7 -> 60-80, 8-9 -> 80-100
+        total_px = float(total_pixels)
+        expanded["area_by_mortality_class"] = []
+        for start, end, (i0, i1) in [(0, 20, (0, 2)), (20, 40, (2, 4)), (40, 60, (4, 6)), (60, 80, (6, 8)), (80, 100, (8, 10))]:
+            c = int(bin_counts[i0:i1].sum()) if len(bin_counts) >= i1 else 0
+            pct = (c / total_px * 100) if total_px > 0 else 0.0
+            expanded["area_by_mortality_class"].append({"range": f"{start}-{end}", "count": c, "percent": pct})
     elif valid_pixels is not None and len(valid_pixels) > 0:
         # Compute from pixel values directly
         total_pixels = len(valid_pixels)
@@ -491,6 +550,13 @@ def compute_expanded_stats(stats: Dict[str, Any], histogram: Optional[Dict[str, 
             "count": int(dominant_count),
             "percent": float(dominant_percent),
         }
+        # Area by Mortality Class (5 bins) from bin_counts
+        total_px = float(total_pixels)
+        expanded["area_by_mortality_class"] = []
+        for start, end, (i0, i1) in [(0, 20, (0, 2)), (20, 40, (2, 4)), (40, 60, (4, 6)), (60, 80, (6, 8)), (80, 100, (8, 10))]:
+            c = int(bin_counts[i0:i1].sum())
+            pct = (c / total_px * 100) if total_px > 0 else 0.0
+            expanded["area_by_mortality_class"].append({"range": f"{start}-{end}", "count": c, "percent": pct})
     else:
         # Fallback: set defaults
         expanded["area_by_threshold"] = {
@@ -503,6 +569,13 @@ def compute_expanded_stats(stats: Dict[str, Any], histogram: Optional[Dict[str, 
             "count": 0,
             "percent": 0.0,
         }
+        expanded["area_by_mortality_class"] = [
+            {"range": "0-20", "count": 0, "percent": 0.0},
+            {"range": "20-40", "count": 0, "percent": 0.0},
+            {"range": "40-60", "count": 0, "percent": 0.0},
+            {"range": "60-80", "count": 0, "percent": 0.0},
+            {"range": "80-100", "count": 0, "percent": 0.0},
+        ]
     
     return expanded
 
@@ -562,9 +635,15 @@ def render_clipped_preview_png(raster_layer_id: int, user_clip_geojson: dict) ->
         raise ValueError(error_msg)
 
 
+# Product name for metadata: VMRC = Vegetation Management Research Cooperative, SMS = Seedling Mortality Simulator
+VMRC_PRODUCT_NAME = "VMRC (Vegetation Management Research Cooperative) Seedling Mortality Simulator (SMS)"
+VMRC_CREDITS = "Vegetation Management Research Cooperative (VMRC) - Seedling Mortality Simulator (SMS)"
+
+
 def build_arcgis_metadata(context: Optional[Dict[str, Any]], raster_name: str) -> Dict[str, str]:
     """
     Build ArcGIS-readable metadata tags from context and raster information.
+    Uses VMRC = Vegetation Management Research Cooperative, Seedling Mortality Simulator (SMS).
     
     Args:
         context: Filter selections from the UI
@@ -575,7 +654,7 @@ def build_arcgis_metadata(context: Optional[Dict[str, Any]], raster_name: str) -
     """
     context = context or {}
     
-    # Build title
+    # Title: concise dataset title
     map_type = expand_map_type(context.get("mapType", ""))
     species = context.get("species", "Unknown Species")
     title_parts = []
@@ -586,7 +665,7 @@ def build_arcgis_metadata(context: Optional[Dict[str, Any]], raster_name: str) -
         title_parts.append(f"Month {context.get('month')}")
     title = " - ".join(title_parts) if title_parts else raster_name
     
-    # Build summary (2-3 sentences)
+    # Summary (idAbs): short abstract, one or two sentences
     summary_parts = []
     if map_type:
         summary_parts.append(f"This dataset represents {map_type.lower()} data for {species}.")
@@ -595,39 +674,27 @@ def build_arcgis_metadata(context: Optional[Dict[str, Any]], raster_name: str) -
         summary_parts.append(f"Climate condition: {condition}.")
     if context.get("coverPercent"):
         summary_parts.append(f"Cover percentage: {context.get('coverPercent')}%.")
-    summary = " ".join(summary_parts) if summary_parts else f"VMRC raster dataset: {raster_name}"
+    summary = " ".join(summary_parts) if summary_parts else f"{VMRC_PRODUCT_NAME} output: {raster_name}"
     
-    # Build full description
-    desc_lines = []
-    desc_lines.append("VMRC (Vegetation Mortality Risk Calculator) Export Dataset")
-    desc_lines.append("")
-    if map_type:
-        desc_lines.append(f"Map Type: {map_type}")
-    if species:
-        desc_lines.append(f"Species: {species}")
-    if condition:
-        desc_lines.append(f"Climate Condition: {condition}")
-    if context.get("coverPercent"):
-        desc_lines.append(f"Cover Percentage: {context.get('coverPercent')}%")
-    if context.get("month"):
-        desc_lines.append(f"Month: {context.get('month')}")
-    if context.get("stressLevel"):
-        desc_lines.append(f"Stress Level: {context.get('stressLevel')}")
-    if context.get("hslClass"):
-        desc_lines.append(f"HSL Class: {context.get('hslClass')}")
-    desc_lines.append("")
-    desc_lines.append("This dataset was clipped to a user-defined Area of Interest (AOI) for analysis and visualization.")
+    # Description (idPurp): product name then structured parameters
+    desc_lines = [
+        "Product: " + VMRC_PRODUCT_NAME,
+        "",
+        "Dataset parameters:",
+    ]
+    for label, value in format_report_selections(context):
+        if value and value != "—":
+            desc_lines.append(f"  {label} {value}")
     description = "\n".join(desc_lines)
     
-    # Build tags (comma-separated keywords)
-    tags_list = ["VMRC"]
+    # Keywords: include full product acronym and SMS for discoverability
+    tags_list = ["VMRC", "Vegetation Management Research Cooperative", "Seedling Mortality Simulator", "SMS"]
     if map_type:
         if "Mortality" in map_type:
             tags_list.append("Mortality")
         if "High Stress Level" in map_type or "HSL" in map_type:
             tags_list.append("HSL")
     if species:
-        # Add species as tag (simplified)
         species_tag = species.replace(" ", "_").replace("-", "_")
         tags_list.append(species_tag)
     if condition:
@@ -636,19 +703,13 @@ def build_arcgis_metadata(context: Optional[Dict[str, Any]], raster_name: str) -
         tags_list.append(f"Cover_{context.get('coverPercent')}%")
     tags = ", ".join(tags_list)
     
-    # Credits
-    credits = "VMRC Project"
-    
-    # Use limitations
-    use_limitations = "For research and visualization purposes only."
-    
     return {
         "TITLE": title,
         "SUMMARY": summary,
         "DESCRIPTION": description,
         "TAGS": tags,
-        "CREDITS": credits,
-        "USE_LIMITATIONS": use_limitations,
+        "CREDITS": VMRC_CREDITS,
+        "USE_LIMITATIONS": "For research and visualization purposes only.",
     }
 
 
@@ -959,6 +1020,58 @@ def fetch_image_as_base64(image_url: str, base_url: str = "http://127.0.0.1:8000
         return None
 
 
+# Max length for any text turned into a PDF Paragraph to prevent LayoutError from huge content
+PDF_MAX_TEXT_LEN = 500
+ACRES_PER_SQ_M = 1.0 / 4046.8564224
+
+
+def safe_text_for_pdf(value: Any, max_len: int = PDF_MAX_TEXT_LEN) -> str:
+    """
+    Sanitize a value for use in a PDF Paragraph/Table cell. Never pass through
+    full GeoJSON, request JSON, or report_json to avoid infinite-height cells.
+    Logs length to help prevent regressions.
+    """
+    if value is None:
+        return "—"
+    if isinstance(value, (dict, list)):
+        # Summarize only (e.g. "3 vertices", "2 features") — never render raw JSON
+        if isinstance(value, list):
+            summary = f"({len(value)} items)"
+        else:
+            keys = list(value.keys())[:5]
+            summary = f"({len(value)} keys: {', '.join(str(k) for k in keys)}…)"
+        text = summary
+    else:
+        text = str(value).strip()
+    if len(text) > max_len:
+        text = text[:max_len] + "…"
+    # Debug: log length so we catch future regressions (do not log full content)
+    print(f"[PDF] Paragraph text length: {len(text)} chars (max {max_len})")
+    return text or "—"
+
+
+def _bounds_to_center(bounds: Any) -> tuple:
+    """Return (center_lon, center_lat) from bounds. Bounds may be dict {west,south,east,north} or list [[south,west],[north,east]]."""
+    if not bounds:
+        return (None, None)
+    if isinstance(bounds, dict):
+        return (
+            (bounds.get("west", 0) + bounds.get("east", 0)) / 2,
+            (bounds.get("south", 0) + bounds.get("north", 0)) / 2,
+        )
+    if isinstance(bounds, (list, tuple)) and len(bounds) >= 2:
+        try:
+            sw, ne = bounds[0], bounds[1]
+            west = sw[1] if isinstance(sw, (list, tuple)) and len(sw) >= 2 else 0
+            south = sw[0] if isinstance(sw, (list, tuple)) else 0
+            east = ne[1] if isinstance(ne, (list, tuple)) and len(ne) >= 2 else 0
+            north = ne[0] if isinstance(ne, (list, tuple)) else 0
+            return ((west + east) / 2, (south + north) / 2)
+        except (IndexError, TypeError):
+            return (None, None)
+    return (None, None)
+
+
 def build_pdf_report_landscape(
     title: str,
     png_bytes: bytes,
@@ -967,332 +1080,362 @@ def build_pdf_report_landscape(
     aoi_name: Optional[str] = None,
     raster_name: Optional[str] = None,
     raster_crs: Optional[Any] = None,
-    context: Optional[Dict[str, Any]] = None
+    context: Optional[Dict[str, Any]] = None,
+    center_lon: Optional[float] = None,
+    center_lat: Optional[float] = None,
 ) -> bytes:
     """
-    Build a professional PDF report in landscape orientation with raster map and statistics.
-    
-    Layout:
-    - Header: Project name, dataset info, date
-    - Map section: Large raster preview with legend
-    - Statistics section: Complete stats table
-    - Footer: Projection, data source, credits
-    
-    Args:
-        title: Report title (dataset name + params)
-        png_bytes: PNG image bytes (colorized raster overlay - same as UI)
-        stats: Statistics dict with min, max, mean, median, std, count (same as UI)
-        legend_bins: List of legend bin dicts with {range, color, label}
-        aoi_name: Optional AOI name
-        raster_name: Optional raster file name
-        raster_crs: Optional raster CRS for footer
-        context: Optional context dict with filter selections
-    
-    Returns:
-        PDF bytes ready for download
+    Build a 2-page PDF report in landscape orientation. Never embeds full GeoJSON/JSON
+    to avoid LayoutError from infinite-height cells; all text is sanitized and capped.
     """
     if not HAS_REPORTLAB:
         raise ValueError("reportlab not installed")
     
-    # Create in-memory PDF buffer
     pdf_buffer = BytesIO()
+    landscape_size = landscape(letter)
     
-    # Create PDF document in landscape orientation
-    landscape_size = landscape(letter)  # 11" x 8.5"
-    
-    # Header callbacks - apply header on every page
     def on_first_page_landscape(canvas, doc):
-        """Add header on first page."""
-        print("[PDF LANDSCAPE] 🔵 on_first_page callback triggered")
         draw_pdf_header(canvas, doc, landscape_size)
-        print("[PDF LANDSCAPE] 🔵 on_first_page callback complete")
     
     def on_later_pages_landscape(canvas, doc):
-        """Add header on subsequent pages."""
-        print("[PDF LANDSCAPE] 🔵 on_later_pages callback triggered")
         draw_pdf_header(canvas, doc, landscape_size)
-        print("[PDF LANDSCAPE] 🔵 on_later_pages callback complete")
     
-    # Calculate top margin: HEADER_H (60pt) + 20pt padding = 80pt
-    # This ensures body content starts BELOW the header and cannot cover it
-    HEADER_H = 60  # Header height in points
-    header_margin = (HEADER_H + 20) / 72.0 * inch  # Convert points to inches (72pt = 1 inch)
-    print(f"[PDF LANDSCAPE] Header margin: {header_margin} inches ({HEADER_H + 20} points)")
-    
+    HEADER_H = 50
+    header_margin = (HEADER_H + 10) / 72.0 * inch
     doc = SimpleDocTemplate(
         pdf_buffer,
         pagesize=landscape_size,
-        topMargin=header_margin,  # CRITICAL: Content starts BELOW header (HEADER_H + 20pt)
-        bottomMargin=0.5*inch,
-        leftMargin=0.5*inch,
-        rightMargin=0.5*inch,
+        topMargin=header_margin,
+        bottomMargin=0.35 * inch,
+        leftMargin=0.4 * inch,
+        rightMargin=0.4 * inch,
         onFirstPage=on_first_page_landscape,
         onLaterPages=on_later_pages_landscape,
     )
     story = []
     styles = getSampleStyleSheet()
     
-    # Title already in header, skip duplicate in body
+    # ----- HEADER on top (Oregon logo left, title center, VMRC logo right) — in story so it always shows
+    story.append(_make_header_table_flowable())
+    story.append(Spacer(1, 0.12 * inch))
     
-    # ============================================================
-    # METADATA SECTION: Export Date, Raster Label
-    # ============================================================
-    # REMOVED: AOI line - do not show AOI in PDF
-    # Build human-readable raster label
-    raster_label = build_human_readable_raster_label(context)
+    # ----- PAGE 1: Content centered and spaced (not congested)
+    export_date_style = ParagraphStyle(
+        name="ExportDate", fontName="Helvetica", fontSize=9,
+        textColor=colors.HexColor("#374151"), spaceAfter=4, alignment=1,
+    )
+    export_date_text = safe_text_for_pdf(datetime.now().strftime("%Y-%m-%d %H:%M"))
+    story.append(Paragraph(f"Export Date: {export_date_text}", export_date_style))
+    story.append(Spacer(1, 0.12 * inch))
     
-    info_data = []
-    info_data.append(["Export Date:", datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
-    info_data.append(["Raster:", raster_label])  # Use human-readable label, not filename
+    # Parameter summary — centered block; label column wide enough so "Seedling Drought Resistance Category" + value don't overlap
+    selection_rows = format_report_selections(context)
+    info_label_style = ParagraphStyle(name="InfoLabel", fontName="Helvetica-Bold", fontSize=9, textColor=colors.HexColor("#111827"), leftIndent=0, rightIndent=0)
+    info_value_style = ParagraphStyle(name="InfoValue", fontName="Helvetica", fontSize=9, textColor=colors.HexColor("#111827"), leftIndent=0)
+    info_data = [
+        [Paragraph(safe_text_for_pdf(label + ":"), info_label_style), Paragraph(safe_text_for_pdf(value), info_value_style)]
+        for label, value in selection_rows
+    ]
+    if not info_data:
+        info_data = [[Paragraph("—", info_label_style), Paragraph("—", info_value_style)]]
+    col_label = 3.4 * inch   # wide enough for "Seedling Drought Resistance Category:"
+    col_value = 3.8 * inch   # plenty of room for value (e.g. "low", "Douglas-fir")
+    info_table = Table(info_data, colWidths=[col_label, col_value])
+    info_table.setStyle(TableStyle([
+        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (0, -1), 0),
+        ("RIGHTPADDING", (0, 0), (0, -1), 14),
+        ("LEFTPADDING", (1, 0), (1, -1), 4),
+        ("RIGHTPADDING", (1, 0), (1, -1), 0),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+        ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#111827")),
+    ]))
+    info_wrapper = Table([[KeepInFrame(col_label + col_value, 2.5 * inch, content=[info_table], mode="shrink")]], colWidths=[col_label + col_value])
+    info_wrapper.hAlign = "CENTER"
+    story.append(info_wrapper)
+    story.append(Spacer(1, 0.14 * inch))
     
-    if info_data:
-        info_table = Table(info_data, colWidths=[1.5*inch, 4*inch])
-        info_table.setStyle(TableStyle([
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-            ('TOPPADDING', (0, 0), (-1, -1), 4),
-        ]))
-        story.append(info_table)
-    
-    story.append(Spacer(1, 0.2*inch))
-    
-    # ============================================================
-    # MAIN CONTENT: Two-column layout (Map + Stats)
-    # ============================================================
-    # Left column: Map with legend
-    # Right column: Statistics
-    
-    # Load PNG image
+    # Raster preview — centered heading and image
+    raster_heading_style = ParagraphStyle(name="RasterH", parent=styles["Heading3"], alignment=1, spaceAfter=6)
+    story.append(Paragraph("<b>Raster Preview</b>", raster_heading_style))
+    story.append(Spacer(1, 0.06 * inch))
     try:
-        # For Platypus Image, use BytesIO directly (not ImageReader)
-        # First, get image dimensions using PIL
-        try:
-            from PIL import Image as PILImage
-            pil_img = PILImage.open(BytesIO(png_bytes))
-            img_width_px, img_height_px = pil_img.size
-            aspect_ratio = img_height_px / img_width_px if img_width_px > 0 else 1.0
-        except ImportError:
-            # Fallback: assume square if PIL not available
-            print("[PDF] Warning: PIL not available, using default aspect ratio")
-            img_width_px, img_height_px = 800, 800
-            aspect_ratio = 1.0
-        
-        # Fit to available width in landscape (about 4.5 inches for left column)
-        max_img_width = 4.5 * inch
-        img_width = max_img_width
-        img_height = img_width * aspect_ratio
-        
-        # Limit height to prevent overflow
-        max_img_height = 5.5 * inch
-        if img_height > max_img_height:
-            img_height = max_img_height
-            img_width = img_height / aspect_ratio
-        
-        # Create Image flowable from BytesIO (not ImageReader)
-        img = Image(BytesIO(png_bytes), width=img_width, height=img_height)
-        
-        # Map section with border
-        map_table = Table([[img]], colWidths=[max_img_width])
-        map_table.setStyle(TableStyle([
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#d1d5db')),
-            ('BACKGROUND', (0, 0), (-1, -1), colors.white),
+        from PIL import Image as PILImage
+        pil_img = PILImage.open(BytesIO(png_bytes))
+        img_width_px, img_height_px = pil_img.size
+        aspect_ratio = img_height_px / img_width_px if img_width_px > 0 else 1.0
+    except Exception:
+        img_width_px, img_height_px = 800, 800
+        aspect_ratio = 1.0
+    max_img_width = 5.5 * inch
+    max_img_height = 1.65 * inch
+    img_width = max_img_width
+    img_height = img_width * aspect_ratio
+    if img_height > max_img_height:
+        img_height = max_img_height
+        img_width = img_height / aspect_ratio
+    try:
+        map_flowable = Image(BytesIO(png_bytes), width=img_width, height=img_height)
+        map_wrapper = Table([[map_flowable]], colWidths=[img_width])
+        map_wrapper.setStyle(TableStyle([
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#d1d5db")),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.white),
         ]))
-        
-        map_section = [
-            Paragraph("<b>Raster Map</b>", styles['Heading3']),
-            Spacer(1, 0.1*inch),
-            map_table,
-        ]
-        
-        print(f"[PDF] ✓ Embedded raster map ({img_width_px}x{img_height_px} px)")
-    except Exception as img_err:
-        print(f"[PDF] Warning: Failed to embed image: {img_err}")
-        import traceback
-        traceback.print_exc()
-        map_section = [
-            Paragraph("<b>Raster Map</b>", styles['Heading3']),
-            Paragraph("Map image unavailable", styles['Normal']),
-        ]
+        map_wrapper.hAlign = "CENTER"
+        story.append(map_wrapper)
+        if center_lon is not None and center_lat is not None:
+            coords_style = ParagraphStyle(
+                name="Coords", fontName="Helvetica", fontSize=8,
+                textColor=colors.HexColor("#6b7280"), spaceAfter=0, alignment=1,
+            )
+            story.append(Paragraph(
+                safe_text_for_pdf(f"Longitude: {center_lon:.4f}, Latitude: {center_lat:.4f}"),
+                coords_style,
+            ))
+    except Exception:
+        story.append(Paragraph("Map image unavailable", styles["Normal"]))
     
-    # Legend
+    # Single page break — content is designed to fit; no page 3
+    story.append(PageBreak())
+    
+    # ----- HEADER on page 2 (same as page 1)
+    story.append(_make_header_table_flowable())
+    story.append(Spacer(1, 0.16 * inch))
+    
+    # ----- PAGE 2: Horizontal legend on top (rows and columns exchanged), then stats and area below
     legend_colors = [
-        colors.HexColor('#006400'), colors.HexColor('#228B22'),
-        colors.HexColor('#9ACD32'), colors.HexColor('#FFD700'),
-        colors.HexColor('#FFA500'), colors.HexColor('#FF8C00'),
-        colors.HexColor('#FF6B00'), colors.HexColor('#FF4500'),
-        colors.HexColor('#DC143C'), colors.HexColor('#B22222'),
+        colors.HexColor("#006400"), colors.HexColor("#228B22"),
+        colors.HexColor("#9ACD32"), colors.HexColor("#FFD700"),
+        colors.HexColor("#FFA500"), colors.HexColor("#FF8C00"),
+        colors.HexColor("#FF6B00"), colors.HexColor("#FF4500"),
+        colors.HexColor("#DC143C"), colors.HexColor("#B22222"),
     ]
     legend_ranges = ["0–10", "10–20", "20–30", "30–40", "40–50",
-                     "50–60", "60–70", "70–80", "80–90", "90–100"]
-    
-    legend_data = [["Color", "Range (%)"]]
-    for range_label in legend_ranges:
-        legend_data.append(["", range_label])
-    
-    legend_table = Table(legend_data, colWidths=[0.8*inch, 1.2*inch])
+                    "50–60", "60–70", "70–80", "80–90", "90–100"]
+    # Horizontal layout: row 0 = color swatches, row 1 = range labels (so nothing is hidden)
+    legend_data = [[""] * 10, legend_ranges]
+    col_w = 0.88 * inch  # wide enough so "90–100" and color box are not hidden
+    legend_col_widths = [col_w] * 10
+    legend_table = Table(legend_data, colWidths=legend_col_widths)
     legend_style = TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2f3a4a')),  # Header background: #2f3a4a
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),  # Header text: white, bold
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),  # Font weight 700 (bold)
-        ('FONTSIZE', (0, 0), (-1, 0), 11),  # Header font size
-        ('FONTSIZE', (0, 1), (-1, -1), 9),  # Data rows keep original size
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),  # Header padding: 8px vertical
-        ('TOPPADDING', (0, 0), (-1, 0), 8),
-        ('LEFTPADDING', (0, 0), (-1, 0), 10),  # Header padding: 10px horizontal
-        ('RIGHTPADDING', (0, 0), (-1, 0), 10),
-        ('BOTTOMPADDING', (0, 1), (-1, -1), 4),  # Data row padding
-        ('TOPPADDING', (0, 1), (-1, -1), 4),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 9),
+        ("FONTSIZE", (0, 1), (-1, 1), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e5e7eb")),
+        ("TEXTCOLOR", (0, 1), (-1, 1), colors.HexColor("#111827")),
     ])
-    # Add color backgrounds
     for i in range(10):
-        legend_style.add('BACKGROUND', (0, i+1), (0, i+1), legend_colors[i])
+        legend_style.add("BACKGROUND", (i, 0), (i, 0), legend_colors[i])
     legend_table.setStyle(legend_style)
     
-    map_section.append(Spacer(1, 0.15*inch))
-    map_section.append(Paragraph("<b>Legend</b>", styles['Heading3']))
-    map_section.append(Spacer(1, 0.05*inch))
-    map_section.append(legend_table)
+    # Acres from pixel count * pixel area (m²); if CRS is meters, acres = m² / 4046.8564224
+    pixel_area_m2 = stats.get("pixel_area_m2") or 0.0
+    total_count = stats.get("count", 0)
+    acres_total = (total_count * pixel_area_m2 * ACRES_PER_SQ_M) if pixel_area_m2 > 0 else 0.0
     
-    # Statistics section
+    # Statistics Summary: header "Seedling Mortality (%)", then Min, Max, Mean, Median, Std Dev, Acres (1 decimal)
+    median_val = stats.get("median")
     stats_data = [
-        ["Metric", "Value"],
-        ["Count", str(stats.get("count", 0))],
-        ["Min", f"{stats.get('min', 0):.2f}"],
-        ["Max", f"{stats.get('max', 0):.2f}"],
-        ["Mean", f"{stats.get('mean', 0):.2f}"],
-        ["Median", f"{stats.get('median', 0):.2f}" if stats.get('median') is not None else "N/A"],
-        ["Std Dev", f"{stats.get('std', 0):.2f}"],
+        ["Seedling Mortality (%)", ""],
+        ["Min", f"{stats.get('min', 0):.1f}"],
+        ["Max", f"{stats.get('max', 0):.1f}"],
+        ["Mean", f"{stats.get('mean', 0):.1f}"],
+        ["Median", f"{median_val:.1f}" if median_val is not None else "N/A"],
+        ["Std Dev", f"{stats.get('std', 0):.1f}"],
+        ["Acres", f"{acres_total:.1f}"],
     ]
-    
-    stats_table = Table(stats_data, colWidths=[2*inch, 2.5*inch])
+    stats_table = Table(stats_data, colWidths=[2.0 * inch, 1.2 * inch])
     stats_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2f3a4a')),  # Header background: #2f3a4a
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),  # Header text: white, bold
-        ('BACKGROUND', (0, 1), (0, -1), colors.HexColor('#f9fafb')),
-        ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#111827')),  # Data rows only (not header)
-        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),  # Header font weight 700 (bold)
-        ('FONTSIZE', (0, 0), (-1, 0), 12),  # Header font size
-        ('FONTSIZE', (0, 1), (-1, -1), 10),  # Data rows keep original size
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),  # Header padding: 8px vertical
-        ('TOPPADDING', (0, 0), (-1, 0), 8),
-        ('LEFTPADDING', (0, 0), (-1, 0), 10),  # Header padding: 10px horizontal
-        ('RIGHTPADDING', (0, 0), (-1, 0), 10),
-        ('BOTTOMPADDING', (0, 1), (-1, -1), 6),  # Data row padding
-        ('TOPPADDING', (0, 1), (-1, -1), 6),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2f3a4a")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e5e7eb")),
+        ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+        ("TEXTCOLOR", (0, 1), (-1, -1), colors.HexColor("#111827")),
     ]))
     
-    stats_section = [
-        Paragraph("<b>Statistics Summary</b>", styles['Heading3']),
-        Spacer(1, 0.1*inch),
-        stats_table,
-    ]
-    
-    # Create two-column layout
-    from reportlab.platypus import KeepTogether
-    left_col = KeepTogether(map_section)
-    right_col = KeepTogether(stats_section)
-    
-    two_col_table = Table([[left_col, right_col]], colWidths=[5*inch, 4.5*inch])
-    two_col_table.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('LEFTPADDING', (0, 0), (0, -1), 0),
-        ('RIGHTPADDING', (1, 0), (1, -1), 0),
+    # Area by Mortality Class (%): fixed classes 0–20, 20–40, 40–60, 60–80, 80–100; columns Seedling Mortality (%), Acres, Area (%)
+    fixed_classes = ["0–20", "20–40", "40–60", "60–80", "80–100"]
+    area_class_rows = [["Seedling Mortality (%)", "Acres", "Area (%)"]]
+    area_by_class = stats.get("area_by_mortality_class") or []
+    for i, range_label in enumerate(fixed_classes):
+        if i < len(area_by_class):
+            row = area_by_class[i]
+            c = row.get("count", 0)
+            pct = row.get("percent", 0)
+            acres_row = (c * pixel_area_m2 * ACRES_PER_SQ_M) if pixel_area_m2 > 0 else 0.0
+            area_class_rows.append([range_label, f"{acres_row:.1f}", f"{pct:.1f}"])
+        else:
+            area_class_rows.append([range_label, "—", "—"])
+    area_table = Table(area_class_rows, colWidths=[1.35 * inch, 1.0 * inch, 1.0 * inch])
+    area_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2f3a4a")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e5e7eb")),
+        ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+        ("TEXTCOLOR", (0, 1), (-1, -1), colors.HexColor("#111827")),
     ]))
     
-    story.append(two_col_table)
-    story.append(Spacer(1, 0.2*inch))
+    # Page 2: vertical stack — horizontal legend on top, then Statistics Summary, then Area by Mortality Class below
+    legend_heading = Paragraph(
+        "<b>Legend — Seedling Mortality (%)</b>",
+        ParagraphStyle(name="L", fontName="Helvetica-Bold", fontSize=10, spaceAfter=10, alignment=1),
+    )
+    story.append(legend_heading)
+    legend_table.hAlign = "CENTER"
+    story.append(legend_table)
+    story.append(Spacer(1, 0.3 * inch))
+    story.append(Paragraph(
+        "<b>Statistics Summary</b>",
+        ParagraphStyle(name="S", fontName="Helvetica-Bold", fontSize=10, spaceAfter=10, alignment=1),
+    ))
+    stats_table.hAlign = "CENTER"
+    story.append(stats_table)
+    story.append(Spacer(1, 0.28 * inch))
+    story.append(Paragraph(
+        "<b>Area by Mortality Class (%)</b>",
+        ParagraphStyle(name="A", fontName="Helvetica-Bold", fontSize=10, spaceAfter=10, alignment=1),
+    ))
+    area_table.hAlign = "CENTER"
+    story.append(area_table)
     
-    # ============================================================
-    # FOOTER: Projection, Data Source, Credits
-    # ============================================================
-    footer_data = []
-    if raster_crs:
-        crs_str = str(raster_crs) if hasattr(raster_crs, '__str__') else str(raster_crs)
-        footer_data.append(["Projection:", crs_str])
-    footer_data.append(["Data Source:", "VMRC Portal"])
-    footer_data.append(["Generated:", datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
-    
-    if footer_data:
-        footer_table = Table(footer_data, colWidths=[1.5*inch, 8*inch])
-        footer_table.setStyle(TableStyle([
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (0, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 0), (-1, -1), 8),
-            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#6b7280')),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
-            ('TOPPADDING', (0, 0), (-1, -1), 2),
-        ]))
-        story.append(footer_table)
-    
-    # Build PDF
-    print("[PDF LANDSCAPE] 🔵 About to call doc.build(story) - header callbacks will execute during build")
     doc.build(story)
-    print("[PDF LANDSCAPE] 🔵 doc.build(story) complete")
-    
-    # Get PDF bytes
     pdf_bytes = pdf_buffer.getvalue()
     pdf_buffer.close()
-    
     print(f"[PDF] ✓ Generated landscape PDF report ({len(pdf_bytes)} bytes)")
     return pdf_bytes
 
 
+def _make_header_table_flowable():
+    """
+    Build header as a Platypus Table flowable: Oregon logo LEFT, title CENTER, VMRC logo RIGHT.
+    Logos are sized to fit the column while preserving aspect ratio so they don't look squashed.
+    """
+    base_dir = Path(__file__).parent.parent.parent.parent
+    # Full-width leader (left to right): landscape frame ~10.2"; use full width so header spans edge to edge
+    frame_width = 10.2 * inch
+    col_left = 2.0 * inch
+    col_center = frame_width - 4.0 * inch  # 6.2"
+    col_right = 2.0 * inch
+    # Max logo size: fit within column while preserving aspect ratio (no squashing)
+    max_logo_height_pt = 52  # ~0.72 inch — large enough to read clearly
+    max_logo_width_pt = 1.35 * 72  # 1.35 inch in points (fits in 1.6" column with padding)
+
+    osu_logo_paths = [
+        base_dir.parent / "vmrc-portal-frontend" / "public" / "oregon.jpg",
+        base_dir / "static" / "logos" / "osu_logo.png",
+        base_dir / "static" / "logos" / "OSU_logo.png",
+        base_dir / "static" / "logos" / "osu.png",
+        base_dir / "static" / "osu_logo.png",
+    ]
+    vmrc_logo_paths = [
+        base_dir.parent / "vmrc-portal-frontend" / "public" / "vmrc.png",
+        base_dir / "static" / "logos" / "vmrc_logo.png",
+        base_dir / "static" / "logos" / "VMRC_logo.png",
+        base_dir / "static" / "logos" / "vmrc.png",
+        base_dir / "static" / "vmrc.png",
+        Path("static/logos/vmrc_logo.png"),
+        Path("static/logos/vmrc.png"),
+        Path("static/vmrc.png"),
+    ]
+    osu_path = next((p for p in osu_logo_paths if p.exists()), None)
+    vmrc_path = next((p for p in vmrc_logo_paths if p.exists()), None)
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        name="HeaderTitle",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=14,
+        textColor=colors.HexColor("#111827"),
+        alignment=1,
+        spaceBefore=0,
+        spaceAfter=0,
+    )
+    title_para = Paragraph("VMRC Seedling Mortality Simulator", title_style)
+
+    def _logo_img(path, max_w_pt, max_h_pt):
+        if not path or not path.exists():
+            return Paragraph("", styles["Normal"])
+        try:
+            from PIL import Image as PILImage
+            with open(path, "rb") as f:
+                pil = PILImage.open(f)
+                iw, ih = pil.size
+            if iw <= 0 or ih <= 0:
+                return Image(str(path), width=max_w_pt, height=max_h_pt)
+            # Scale to fit within max box, preserving aspect ratio (no squashing)
+            scale = min(max_w_pt / iw, max_h_pt / ih)
+            w, h = iw * scale, ih * scale
+            return Image(str(path), width=w, height=h)
+        except Exception:
+            return Paragraph("", styles["Normal"])
+
+    left_cell = _logo_img(osu_path, max_logo_width_pt, max_logo_height_pt)
+    right_cell = _logo_img(vmrc_path, max_logo_width_pt, max_logo_height_pt)
+    header_table = Table(
+        [[left_cell, title_para, right_cell]],
+        colWidths=[col_left, col_center, col_right],
+    )
+    header_table.setStyle(
+        TableStyle([
+            ("ALIGN", (0, 0), (0, 0), "LEFT"),
+            ("ALIGN", (1, 0), (1, 0), "CENTER"),
+            ("ALIGN", (2, 0), (2, 0), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f3f4f6")),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+            ("TOPPADDING", (0, 0), (-1, -1), 10),
+            ("LEFTPADDING", (0, 0), (-1, -1), 12),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+            ("LINEBELOW", (0, 0), (-1, -1), 1.5, colors.HexColor("#d1d5db")),
+        ])
+    )
+    header_table.hAlign = "CENTER"
+    return header_table
+
+
 def draw_pdf_header(canvas, doc, pagesize):
     """
-    Draw PDF header with title, logos, and divider line.
-    Reusable function called on every page.
-    
-    CRITICAL: In ReportLab, (0,0) is at BOTTOM LEFT, Y increases upward.
-    To draw at top: use y = page_height - offset
-    
-    Args:
-        canvas: ReportLab canvas object
-        doc: Document object (not used but required for callback signature)
-        pagesize: Tuple of (width, height) in points
+    Header at top of every page: Oregon logo LEFT, "VMRC Seedling Mortality Simulator" CENTER, VMRC logo RIGHT.
+    Drawn on the canvas only; body content starts below the reserved top margin.
     """
     print("[PDF] 🔵 CALLING draw_pdf_header - START")
     canvas.saveState()
     
     page_width, page_height = pagesize
-    HEADER_H = 60  # Header height in points
+    HEADER_H = 50  # Header height in points (tight to top of page)
     
-    # ReportLab: (0,0) is bottom-left, so top of page is at y = page_height
-    # Draw rectangle from top: y_start = page_height - HEADER_H, height = HEADER_H
-    
-    # VISIBLE TEST: Draw a top band rectangle so we can confirm it renders
-    # RGB(245, 245, 245) = light gray
-    canvas.setFillColorRGB(0.96, 0.96, 0.96)  # RGB(245,245,245) normalized to 0-1
+    # ReportLab: (0,0) is bottom-left; top of page = page_height. Draw header band at very top.
+    canvas.setFillColorRGB(0.96, 0.96, 0.96)  # Light gray
     canvas.rect(0, page_height - HEADER_H, page_width, HEADER_H, fill=1, stroke=0)
     print(f"[PDF] ✓ Drew header background rectangle: x=0, y={page_height - HEADER_H}, w={page_width}, h={HEADER_H}")
     
-    # Title: "VMRC Mortality Calculation" centered
-    # Position: 35 points from top = page_height - 35
-    canvas.setFont("Helvetica-Bold", 16)
-    canvas.setFillColorRGB(0.07, 0.07, 0.07)  # RGB(20,20,20) = dark gray
-    title_text = "VMRC Mortality Calculation"
-    title_width = canvas.stringWidth(title_text, "Helvetica-Bold", 16)
-    title_y = page_height - 15  # 35 points from top
-    title_x = (page_width - title_width) / 2  # Centered
-    canvas.drawString(title_x, title_y, title_text)
-    print(f"[PDF] ✓ Drew title: '{title_text}' at x={title_x:.1f}, y={title_y}")
-    
-    # Logos: 40px tall, keep aspect ratio
-    logo_height = 40
-    logo_margin = 0.5 * inch  # Margin from page edges
-    
-    # Get base directory (backend root)
-    base_dir = Path(__file__).parent.parent.parent.parent  # Go up from app/api/v1/routes_raster_export.py to backend root
-    
-    # OSU logo on LEFT (oregon.jpg in /public folder)
+    # Logos first so title can be drawn on top (no overlap)
+    logo_height = 28
+    logo_margin = 0.4 * inch
+    base_dir = Path(__file__).parent.parent.parent.parent
+
+    # Oregon (OSU) logo on the LEFT
     osu_logo_paths = [
         base_dir.parent / "vmrc-portal-frontend" / "public" / "oregon.jpg",  # Primary: /public/oregon.jpg
         base_dir / "static" / "logos" / "osu_logo.png",
@@ -1314,7 +1457,7 @@ def draw_pdf_header(canvas, doc, pagesize):
             img_width, img_height_orig = osu_img.getSize()
             # Calculate width maintaining aspect ratio
             logo_width = logo_height * (img_width / img_height_orig) if img_height_orig > 0 else logo_height
-            logo_y = page_height - logo_height - 10  # 10px from top
+            logo_y = page_height - logo_height - 6  # 6pt from top (header at top of page)
             canvas.drawImage(osu_img, logo_margin, logo_y, width=logo_width, height=logo_height, preserveAspectRatio=True)
             print(f"[PDF] ✓ Loaded OSU logo from: {osu_logo_path}")
         except Exception as e:
@@ -1347,7 +1490,7 @@ def draw_pdf_header(canvas, doc, pagesize):
             img_width, img_height_orig = vmrc_img.getSize()
             # Calculate width maintaining aspect ratio
             logo_width = logo_height * (img_width / img_height_orig) if img_height_orig > 0 else logo_height
-            logo_y = page_height - logo_height - 10  # 10px from top
+            logo_y = page_height - logo_height - 6  # 6pt from top (header at top of page)
             logo_x = page_width - logo_width - logo_margin
             canvas.drawImage(vmrc_img, logo_x, logo_y, width=logo_width, height=logo_height, preserveAspectRatio=True)
             print(f"[PDF] ✓ Loaded VMRC logo from: {vmrc_logo_path}")
@@ -1356,7 +1499,16 @@ def draw_pdf_header(canvas, doc, pagesize):
     else:
         print(f"[PDF] Info: VMRC logo not found (checked {len(vmrc_logo_paths)} paths)")
     
-    # Divider line at y = page_height - HEADER_H (bottom of header)
+    # Title "VMRC Seedling Mortality Simulator" in the CENTER (drawn last so it is never covered by logos)
+    canvas.setFont("Helvetica-Bold", 14)
+    canvas.setFillColorRGB(0.07, 0.07, 0.07)
+    title_text = "VMRC Seedling Mortality Simulator"
+    title_width = canvas.stringWidth(title_text, "Helvetica-Bold", 14)
+    title_x = (page_width - title_width) / 2
+    title_y = page_height - 14
+    canvas.drawString(title_x, title_y, title_text)
+    
+    # Divider line at bottom of header
     divider_y = page_height - HEADER_H
     canvas.setStrokeColorRGB(0.82, 0.82, 0.82)  # RGB(180,180,180) = light gray
     canvas.setLineWidth(1)
@@ -1499,18 +1651,18 @@ def build_pdf_report(
     else:
         header_cells.append(Paragraph("", styles['Normal']))  # Empty cell if logo not found
     
-    # Center: Title "VMRC Mortality Calculation"
+    # Center: Title VMRC Seedling Mortality Simulator
     title_style = ParagraphStyle(
         'HeaderTitle',
         parent=styles['Heading1'],
-        fontSize=22,
+        fontSize=16,
         textColor=colors.HexColor('#111827'),
         alignment=1,  # Center
         spaceAfter=0,
         spaceBefore=0,
         fontName='Helvetica-Bold',  # Font weight 700 (bold)
     )
-    header_cells.append(Paragraph("VMRC Mortality Calculation", title_style))
+    header_cells.append(Paragraph("VMRC Seedling Mortality Simulator", title_style))
     
     # Right: VMRC logo (or empty space)
     if vmrc_logo_path:
@@ -1553,18 +1705,15 @@ def build_pdf_report(
     story.append(Spacer(1, 0.25*inch))  # 20px margin-bottom equivalent
     
     # ============================================================
-    # METADATA SECTION: Export Date, Raster Label
+    # METADATA: Export Date + Raster / Selection Summary (label + value, required order)
     # ============================================================
-    # Build human-readable raster label
-    raster_label = build_human_readable_raster_label(context)
-    
-    # REMOVED: AOI line - do not show AOI in PDF
-    info_data = []
-    info_data.append(["Export Date:", datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
-    info_data.append(["Raster:", raster_label])  # Use human-readable label, not filename
-    
+    info_data = [["Export Date:", datetime.now().strftime('%Y-%m-%d %H:%M:%S')]]
+    selection_rows = format_report_selections(context)
+    for label, value in selection_rows:
+        info_data.append([label + ":", value])
+
     if info_data:
-        info_table = Table(info_data, colWidths=[1.5*inch, 8*inch])
+        info_table = Table(info_data, colWidths=[2.2*inch, 6.8*inch])
         info_table.setStyle(TableStyle([
             ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
             ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
@@ -1573,7 +1722,6 @@ def build_pdf_report(
             ('TOPPADDING', (0, 0), (-1, -1), 4),
         ]))
         story.append(info_table)
-    
     story.append(Spacer(1, 0.2*inch))
     
     # ============================================================
@@ -1655,8 +1803,8 @@ def build_pdf_report(
     
     legend_ranges = ["0–10", "10–20", "20–30", "30–40", "40–50", "50–60", "60–70", "70–80", "80–90", "90–100"]
     
-    # Build legend table: [Color Box, Range Label]
-    legend_data = [["Color", "Range (%)"]]
+    # Build legend table: [Color Box, Seedling Mortality (%)]
+    legend_data = [["Color", "Seedling Mortality (%)"]]
     for range_label in legend_ranges:
         legend_data.append(["", range_label])
     
@@ -1777,43 +1925,7 @@ def build_pdf_report(
         story.append(KeepTogether(threshold_section))
         story.append(Spacer(1, 0.3*inch))
     
-    # ============================================================
-    # EXPANDED STATISTICS: Most Common Value Range
-    # ============================================================
-    if "most_common_range" in stats:
-        range_section = []
-        range_section.append(Paragraph("<b>Most Common Value Range</b>", styles['Heading2']))
-        range_section.append(Spacer(1, 0.1*inch))
-        
-        range_data = [
-            ["Range", "Count", "Coverage"],
-            [stats["most_common_range"]["range"],
-             str(stats["most_common_range"]["count"]),
-             f"{stats['most_common_range']['percent']:.2f}%"],
-        ]
-        
-        range_table = Table(range_data, colWidths=[2*inch, 2*inch, 2*inch])
-        range_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2f3a4a')),  # Header background: #2f3a4a
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),  # Header text: white, bold
-            ('BACKGROUND', (0, 1), (0, -1), colors.HexColor('#f9fafb')),
-            ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#111827')),  # Data rows only (not header)
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),  # Header font weight 700 (bold)
-            ('FONTSIZE', (0, 0), (-1, 0), 12),  # Header font size
-            ('FONTSIZE', (0, 1), (-1, -1), 10),  # Data rows keep original size
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),  # Header padding: 8px vertical
-            ('TOPPADDING', (0, 0), (-1, 0), 8),
-            ('LEFTPADDING', (0, 0), (-1, 0), 10),  # Header padding: 10px horizontal
-            ('RIGHTPADDING', (0, 0), (-1, 0), 10),
-            ('BOTTOMPADDING', (0, 1), (-1, -1), 6),  # Data row padding
-            ('TOPPADDING', (0, 1), (-1, -1), 6),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
-        ]))
-        range_section.append(range_table)
-        
-        story.append(KeepTogether(range_section))
+    # Most Common Value Range section REMOVED for one-page report (per requirements).
     
     # Build PDF
     print("[PDF] 🔵 About to call doc.build(story) - header callbacks will execute during build")
@@ -2074,25 +2186,12 @@ def export_multi_aoi_pdf(req: ExportRequest):
         print(f"Warning: Could not resolve raster path: {e}")
         raster_name = "unknown.tif"
     
-    # Build dataset title from context
-    dataset_title = "VMRC Export Report"
+    # Build dataset title from context (same display values as Raster/Selection Summary)
+    dataset_title = "VMRC Seedling Mortality Simulator"
     if req.context:
-        dataset_parts = []
-        if req.context.get("mapType"):
-            dataset_parts.append(expand_map_type(req.context.get("mapType")))
-        if req.context.get("species"):
-            dataset_parts.append(req.context.get("species"))
-        if req.context.get("condition"):
-            dataset_parts.append(expand_condition(req.context.get("condition")))
-        if req.context.get("month"):
-            dataset_parts.append(f"Month {req.context.get('month')}")
-        if req.context.get("coverPercent"):
-            dataset_parts.append(f"Cover {req.context.get('coverPercent')}%")
-        if req.context.get("hslClass"):
-            dataset_parts.append(f"HSL Class {req.context.get('hslClass')}")
-        
-        if dataset_parts:
-            dataset_title = " · ".join(dataset_parts)
+        parts = [v for (_, v) in format_report_selections(req.context) if v and v != "—"]
+        if parts:
+            dataset_title = " · ".join(parts)
     
     # Generate one page per AOI
     for idx, aoi_data in enumerate(req.overlay_urls):
@@ -2630,7 +2729,7 @@ def export_raster(req: ExportRequest):
                 writer = csv.writer(f)
                 
                 # Write report metadata as comment header
-                writer.writerow(["# VMRC Export Report"])
+                writer.writerow(["# VMRC Seedling Mortality Simulator Export"])
                 writer.writerow([f"# Export Date: {report_metadata['export_date']}"])
                 writer.writerow([f"# Export ID: {export_id}"])
                 writer.writerow([f"# Software: {report_metadata['software']}"])
@@ -2640,22 +2739,9 @@ def export_raster(req: ExportRequest):
                 
                 context = req.context or {}
                 if context:
-                    writer.writerow(["# Filter Selections:"])
-                    if context.get("mapType"):
-                        writer.writerow([f"#   Map Type: {expand_map_type(context.get('mapType'))}"])
-                    if context.get("species"):
-                        writer.writerow([f"#   Species: {context.get('species')}"])
-                    if context.get("condition"):
-                        writer.writerow([f"#   Condition: {expand_condition(context.get('condition'))}"])
-                    if context.get("month"):
-                        writer.writerow([f"#   Month: {context.get('month')}"])
-                    if context.get("coverPercent"):
-                        writer.writerow([f"#   Cover %: {context.get('coverPercent')}"])
-                    if context.get("stressLevel"):
-                        writer.writerow([f"#   Stress Level: {context.get('stressLevel')}"])
-                    if context.get("hslClass"):
-                        writer.writerow([f"#   HSL Class: {context.get('hslClass')}"])
-                
+                    writer.writerow(["# Raster / Selection Summary:"])
+                    for label, value in format_report_selections(context):
+                        writer.writerow([f"#   {label}: {value}"])
                 writer.writerow([])
                 
                 # Write stats summary
@@ -2852,25 +2938,12 @@ def export_raster(req: ExportRequest):
                 # ============================================================
                 # BUILD PDF REPORT WITH RASTER PREVIEW
                 # ============================================================
-                # Build title with dataset name and AOI name
-                title_text = "VMRC Export Report"
+                # Build title from context (same display values as Raster/Selection Summary)
+                title_text = "VMRC Seedling Mortality Simulator"
                 if req.context:
-                    dataset_parts = []
-                    if req.context.get("mapType"):
-                        dataset_parts.append(expand_map_type(req.context.get("mapType")))
-                    if req.context.get("species"):
-                        dataset_parts.append(req.context.get("species"))
-                    if req.context.get("condition"):
-                        dataset_parts.append(expand_condition(req.context.get("condition")))
-                    if req.context.get("month"):
-                        dataset_parts.append(f"Month {req.context.get('month')}")
-                    if req.context.get("coverPercent"):
-                        dataset_parts.append(f"Cover {req.context.get('coverPercent')}%")
-                    if req.context.get("hslClass"):
-                        dataset_parts.append(f"HSL Class {req.context.get('hslClass')}")
-                    
-                    if dataset_parts:
-                        title_text = " · ".join(dataset_parts)
+                    parts = [v for (_, v) in format_report_selections(req.context) if v and v != "—"]
+                    if parts:
+                        title_text = " · ".join(parts)
                 
                 # Calculate median if not in stats
                 median = None
@@ -2902,6 +2975,21 @@ def export_raster(req: ExportRequest):
                 # Merge expanded stats into pdf_stats
                 pdf_stats.update(expanded_stats)
                 
+                # Pixel area (m²) for Acres: count * pixel_area_m2 / 4046.8564224 (always set so PDF never misses key)
+                pixel_area_m2 = 0.0
+                if raster_path and Path(raster_path).exists():
+                    try:
+                        res = compute_pixel_size(Path(raster_path))
+                        if res and len(res) >= 2:
+                            pixel_area_m2 = float(res[0]) * float(res[1])
+                    except Exception:
+                        pass
+                pdf_stats["pixel_area_m2"] = pixel_area_m2
+                
+                # Center lon/lat for caption (bounds from context may be list [[south,west],[north,east]])
+                bounds = clip_result.get("bounds") or {}
+                center_lon, center_lat = _bounds_to_center(bounds)
+                
                 # Legend bins (matching colormap)
                 legend_bins = [
                     {"range": "0–10", "color": "#006400", "label": "0–10"},
@@ -2916,15 +3004,25 @@ def export_raster(req: ExportRequest):
                     {"range": "90–100", "color": "#B22222", "label": "90–100"},
                 ]
                 
-                # Always generate PDF (with or without image)
-                pdf_bytes = build_pdf_report(
+                # Generate 2-page PDF (same layout as direct PDF download)
+                raster_crs = None
+                if raster_path and Path(raster_path).exists():
+                    try:
+                        with rasterio.open(raster_path) as src:
+                            raster_crs = src.crs
+                    except Exception:
+                        pass
+                pdf_bytes = build_pdf_report_landscape(
                     title=title_text,
-                    png_bytes=png_bytes,  # May be None if generation failed
+                    png_bytes=png_bytes if png_bytes else b"",  # Must be bytes; empty if unavailable
                     stats=pdf_stats,
                     legend_bins=legend_bins,
                     aoi_name=req.aoi_name,
                     raster_name=raster_name,
-                    context=req.context
+                    raster_crs=raster_crs,
+                    context=req.context,
+                    center_lon=center_lon,
+                    center_lat=center_lat,
                 )
                     
                 # Write PDF bytes to file
@@ -2968,7 +3066,7 @@ def export_raster(req: ExportRequest):
                 story = []
                 styles = getSampleStyleSheet()
                 
-                story.append(Paragraph("VMRC Export Report", styles['Heading1']))
+                story.append(Paragraph("VMRC Seedling Mortality Simulator", styles['Heading1']))
                 story.append(Spacer(1, 0.2*inch))
                 story.append(Paragraph(f"<b>Export Date:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
                 story.append(Spacer(1, 0.3*inch))
@@ -3040,6 +3138,7 @@ async def export_pdf_report(req: PDFExportRequest):
         png_bytes = None
         stats = None
         bounds = None
+        clip_result = None  # kept for histogram / expanded stats when we re-clip
         raster_crs = None
         raster_name = None
         
@@ -3096,7 +3195,11 @@ async def export_pdf_report(req: PDFExportRequest):
                 detail="Failed to compute statistics for PDF"
             )
         
-        # Get raster info for footer
+        # Bounds (for center caption) — from clip_result when we re-clipped
+        bounds = clip_result.get("bounds", {}) if clip_result else {}
+        
+        # Get raster info for footer and pixel area for Acres
+        raster_path = None
         try:
             from app.services.raster_service import resolve_raster_path
             from app.services.raster_index import RASTER_LOOKUP_LIST
@@ -3129,25 +3232,12 @@ async def export_pdf_report(req: PDFExportRequest):
         # ============================================================
         # STEP 3: Build title from context
         # ============================================================
-        title_text = "VMRC Export Report"
+        title_text = "VMRC Seedling Mortality Simulator"
         context = req.context or {}
         if context:
-            dataset_parts = []
-            if context.get("mapType"):
-                dataset_parts.append(expand_map_type(context.get("mapType")))
-            if context.get("species"):
-                dataset_parts.append(context.get("species"))
-            if context.get("condition"):
-                dataset_parts.append(expand_condition(context.get("condition")))
-            if context.get("month"):
-                dataset_parts.append(f"Month {context.get('month')}")
-            if context.get("coverPercent"):
-                dataset_parts.append(f"Cover {context.get('coverPercent')}%")
-            if context.get("hslClass"):
-                dataset_parts.append(f"HSL Class {context.get('hslClass')}")
-            
-            if dataset_parts:
-                title_text = " · ".join(dataset_parts)
+            parts = [v for (_, v) in format_report_selections(context) if v and v != "—"]
+            if parts:
+                title_text = " · ".join(parts)
         
         # ============================================================
         # STEP 4: Prepare stats for PDF (ensure median is included)
@@ -3166,6 +3256,23 @@ async def export_pdf_report(req: PDFExportRequest):
             # Try to get pixel values from clip_result if available
             # Otherwise, median will be "N/A" in PDF
             pass
+        
+        # Merge expanded stats (area_by_mortality_class, etc.) when we have histogram
+        histogram = clip_result.get("histogram") if clip_result else (context.get("histogram") if isinstance(context, dict) else None)
+        expanded_stats = compute_expanded_stats(pdf_stats, histogram=histogram)
+        pdf_stats.update(expanded_stats)
+        
+        # Pixel area (m²) for Acres in PDF
+        if raster_path and Path(raster_path).exists():
+            try:
+                res = compute_pixel_size(Path(raster_path))
+                pdf_stats["pixel_area_m2"] = (float(res[0]) * float(res[1])) if res and len(res) >= 2 else 0.0
+            except Exception:
+                pdf_stats["pixel_area_m2"] = 0.0
+        else:
+            pdf_stats["pixel_area_m2"] = 0.0
+        
+        center_lon, center_lat = _bounds_to_center(bounds)
         
         # ============================================================
         # STEP 5: Generate PDF with landscape orientation
@@ -3194,7 +3301,9 @@ async def export_pdf_report(req: PDFExportRequest):
             aoi_name=req.aoi_name,
             raster_name=raster_name,
             raster_crs=raster_crs,
-            context=context
+            context=context,
+            center_lon=center_lon,
+            center_lat=center_lat,
         )
         
         print(f"[PDF EXPORT] 🔵 PDF export: COMPLETE - Generated PDF ({len(pdf_bytes)} bytes)")
